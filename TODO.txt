@@ -75,3 +75,15 @@ when DEFROST_INPUT is high, switch DEFROST_LED to HIGH
 when CABLIGHT_INPUT is high, switch CABLIGHT_LED to HIGH
 when WARNING_INPUT is high, switch WARNING_LED to HIGH
 when BROUILLARD_INPUT is high, switch BROUILLARD_LED to HIGH
+
+
+Use ESP32 FreeRTOS on Arduino  IDE
+
+INPUTS Loop (1kHz mini)
+Call AceButton and AceRotary to handle buttons and give event
+
+LOGIC FSMs
+execute each FSM with the event queue
+
+OUTPUT 
+PID V1 
