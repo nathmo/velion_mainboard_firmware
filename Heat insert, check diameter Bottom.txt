@@ -1,0 +1,5 @@
+Heat insert, check diameter Bottom case for pcb mouting hole, hole seems to big
+case, one hole is too big for the connector (Bottom side)
+Wiring Harness check connector, swapped from 4 to 5 pole for mistake proofing
+document color code + pinout ( black=1, green=2, yellow=3, red=4) + cable lenght
+XT 60 (2+4) fix pinout number 
