@@ -2,20 +2,30 @@
 This is the firmware that control the main board and control pannel of the vehicle.
 
 # General logic
-Use ESP32 FreeRTOS on Arduino  IDE
+Use ESP32 FreeRTOS on Arduino  IDE (ESP32 by Espressif, V 2.0.17)
 
-there is a mainloop which first read the input, generate event. then iterrate over all state machine and feed them the first event untill all event are consumed. then there the output stage which run the PID step and the output monitoring.
+there is a mainloop which first read the input, generate event. then iterrate over all state machine and feed them the event. then there the output stage which run the PID step and the output monitoring.
 
-INPUTS Loop (1kHz mini)
+the following loop should run at least at 1 Khz :
+
+INPUTS 
 Call AceButton and AceRotary to handle buttons and give event
+read all the sensor
+process CAN message
+
+Event generation
+process state and generate event
 
 LOGIC FSMs
-execute each FSM with the event queue
+execute each FSM with the event table
 
 OUTPUT 
-PID V1 
+PID V1
+CAN message broadcasting
+PWM ouput
+on/off toggling
 
-# Pin mapping 
+# Pin mapping  (HAL)
 GPIO 36 : Analog input  (THROTTLE_INPUT)
 GPIO 39 : Digital input (InterruptEXTGPIO)
 GPIO 34 : rotary encoder 1, channel A (POT_SPEED_A)
@@ -53,7 +63,6 @@ GPA1 : AUXUSB_MOSFET_GATE (drive with ON / OFF)
 GPA2 : LATCH_TRUNK_MOSFTET_GATE (drive with ON / OFF)
 GPA3 : POWER_MOSFET_GATE (drive with ON / OFF)
 
-
 the second MCP with address 0100000 = 0x20
 
 GPB0 : Defroster_ALERT (input that must be configured with interrupt on INTA)
@@ -74,99 +83,387 @@ GPA5 : CABLIGHT_INPUT (button, enable the pull-up)
 GPA6 : WARNING_INPUT (button, enable the pull-up)
 GPA7 : MAP_INPUT (button, enable the pull-up)
 
-I also have a GY-91 with MPU-9250 and BMP280 as a 10 DOF IMU. address for the  MPU9250 shoud led 1101000 = 0x68, BMP : 1110110 = 0x76
+I also have a GY-91 with MPU-9250 and BMP280 as a 10 DOF IMU. address for the  MPU9250 shoud be 1101000 = 0x68, BMP : 1110110 = 0x76
+
+there is also four INA228 with 1 mOhm resistor. the current measured should never exceed 50 A.
+0x40 is the address of the INA measuring the total current consumption
+0x41 is the address of the INA measuring the hand heater current consumption
+0x44 is the address of the INA measuring the seat heater current consumption
+0x45 is the address of the INA measuring the defroster current consumption
+
+there are also all the CAN packet that can set virtual input (for instance, the luminisity level from the front and rear board or the error status of the lightning system or the battery SOC, SOH, the PAS cadense broadcasted by the motor controller, the front and rear proximity sensor) or act as virtual output (blinker left / right, fog beam, ...)
+
+TIMER, for each FSM as needed. they can be implemented in software / hardware and thus have a HAL
+
+# CAN messages
 
 
-# Input event
+| System            | ID Range Used |
+| ----------------- | ------------- |
+| mainboard         | `0x420–0x480` |
+| rearboard         | `0x481–0x490` |
+| frontboard        | `0x491–0x500` |
+| siliXcon Request  | `0x630–0x637` |
+| siliXcon Response | `0x640–0x647` |
+| siliXcon Control  | `0x5FF`       |
+| VDS Button Event  | `0x5FE`       |
+| BMS Telemetry     | `0x610–0x619` |
+| BMS Heartbeat RX  | `0x601`       |
+
+
+# input conditionning
+read the value from HAL and update the local state or event (ace rotatry and button generate directly the cleaned event too)
+(just a list of function with simple conversion)
+
+# output conditionning
+apply the local state to the physical system (mosftet on / off / duty cycle, CAN broadcast at correct interval, PID computation)
+(just a list of function with simple conversion)
+
+# local state (ST)
+this is a local and up to date copy of the local state used to compute the event. it also have the "history" of the last N state to be able to compute the EVENT on state change.
+
+temperature
+acceleration (lateral ,longitudinal, vertical, yaw, pitch, roll)
+altitude
+current consumtion at the mainboard input
+current consuption for the heaters, defroster
+output state
+PID setpoint
+PID current value
+PID past value
+FSM current state
+timer value and state (running, stopped)
+
+...
+
+# Input event (EV)
+this is our logic filter to explicitly define what condition are required to generate an event.
+theses event should be "state less"/ not require information outside the ST table. if I need N sample to compute a derivate then I store the N last sample in the ST table.
+it work like an interrupt bit list. Event can be set and are cleared after each cycle. 
+
 button/switch pressed
 button/switch released short press
 button/switch releasd long press
+button/switch releasd (dont care if it was long or short)
 rotary increment / decrement
 analog value exceed a threshold
-can packet
+can packet timeout
 lateral acceleration exceed a threshold
 longitudinal acceleration excced a threshold
+current above threshold
+timer timeout
+composite event that arrise when some conditions are met.
+
+## EVENT list
+EV_SEATSENSOR_RELEASED
+EV_SEATSENSOR_PRESSED
+EV_DRIVING
+EV_STATIONNARY
+
+EV_VEHICLE_SPEED_ABOVE_5KPH
+EV_VEHICLE_SPEED_BELOW_5KPH
+
+
+EV_BTN_BROUILLARD_SHORT
+EV_BTN_BROUILLARD_LONG
+EV_FOG_ON_TIMER_TIMEOUT
+
+EV_BTN_DEFROSTER_SHORT_AND_BATTERY_OK
+EV_BTN_DEFROSTER_LONG_AND_BATTERY_OK
+EV_BTN_DEFROSTER_SHORT
+EV_BTN_DEFROSTER_LONG
+EV_DEFROSTER_ON_TIMER_TIMEOUT
+EV_DEFROSTER_FAULT_TIMER_TIMEOUT
+EV_DEFROSTER_BLINK_TIMER_TIMEOUT
+EV_DEFROSTER_ON_TIMER_RUNNING
+EV_DEFROSTER_FAULT_TIMER_RUNNING
+EV_DEFROSTER_BLINK_TIMER_RUNNING
+
+EV_BTN_CABLIGHT_AND_STATIONNARY
+EV_BTN_CABLIGHT_AND_DRIVING
+EV_BTN_CABLIGHT_RELEASED
+EV_CABINLIGHT_TIMER_LONG_TIMEOUT
+EV_CABINLIGHT_TIMER_SHORT_TIMEOUT
+
+EV_BTN_TRUNK_RELEASED_AND_STATIONNARY
+EV_BTN_TRUNK_RELEASED_AND_DRIVING
+EV_TRUNK_ACTION_TIMER_TIMEOUT
+EV_TRUNK_BLINK_TIMER_TIMEOUT
+EV_TRUNK_ERROR_TIMER_TIMEOUT
+
+EV_BTN_FORWARD_SHORT
+EV_BTN_FORWARD_LONG
+EV_BTN_REVERSE_SHORT
+EV_BTN_REVERSE_LONG
+EV_DRIVE_CHANGE_TIMER_TIMEOUT
 
 # State machines
-general rules about timer, if set while running, is start again at the set time but will not generate more than ONE timeout event.
-we should have an event queue and a STATE table. the state table is for global state that must be present or absent for something to happen with an event. the event are for every state change.
+they can only change state on INPUT event.
+FSM state change only happen on event. no logic should be implemented there like event A and B should arrise. this is handled in the input event. but we can have multiple event that can trigger a state change (OR but no AND)
 
-# STATE MACHINES (FSM DEFINITIONS)
+general rules about timer, if set while running, is restart again at the set time but will not generate more than ONE timeout event.
 
-## GLOBAL FSM RULES
+only ONE state machine can exist at most to change an output.
+(for instance, for blinker and warning, we have 9 output (left + right blinker on the front, read, center of the vehicle, we have the visual feedback on the warning button, we have visual and audio feedback on the VDS display (left + right)) and thus all theses are controlled by only ONE FSM to explicit what happen and avoid edge case like for instance when the warning button is pressed but the blinker is also toggled and both try to interract with the blinker light at the same time.
+
+## STATE list
+
+ST_FSM_FOG_OFF | ST_FSM_FOG_ON | ST_FSM_FOG_ON_GRACE
+ST_FSM_DEFROSTER_OFF | ST_FSM_DEFROSTER_ON | ST_FSM_DEFROSTER_FAULT_BLINK_OFF | ST_FSM_DEFROSTER_FAULT_BLINK_ON
+ST_CABINLIGHT_OFF | ST_CABINLIGHT_ON | ST_CABINLIGHT_ON_TRUNK | ST_CABINLIGHT_ON_DRV
+ST_TRUNK_LATCHED | ST_TRUNK_OPENING | ST_TRUNK_BLINK_ON | ST_TRUNK_BLINK_OFF
+
+## GLOBAL finite state machines RULES (FSM DEFINITIONS)
 
 * FSMs consume events from a **global event queue**
 * Each FSM has **its own timer(s)**
-
   * If a timer is started while already running, it **restarts**
   * A timer **emits only ONE timeout event**
 * `ST_` = current state
+* `ST_FSM` = FSM state
 * `EV_` = discrete event
-* Transitions are **edge-driven only**
-* Outputs are applied in the **output stage**, never in input logic
+* Transitions are **event-driven only**
+* Outputs are applied in the **output stage**, we just update the state
 
 ---
 
-## FOG LIGHT FSM
+## power on / off
+when the VDS display button is pressed for N seconds, a message is sent on the CAN bus.
+we must toggle the KEY/POWER pin of the controller when that message is received.
+
+we are also responsible for turning it off if the button is long pressed or if the vehicle is IDLE for more than 60 minute
 
 ### States
-
 ```
-ST_FOG_OFF        (default)
-ST_FOG_ON
+ST_POWER_OFF      (default / safe)
+ST_POWER_ON
+ST_POWER_ON_GRACE
 ```
 
 ### Transitions
 
 ```
-ST_FOG_OFF -> ST_FOG_ON
+ST_POWER_OFF -> ST_POWER_ON
+  on EV_POWER_BUTTON_SHORT_CAN
+  on EV_POWER_BUTTON_LONG_CAN 
+  
+ST_POWER_ON -> ST_POWER_OFF
+  on EV_POWER_BUTTON_SHORT_CAN
+  on EV_POWER_BUTTON_LONG_CAN 
+
+ST_POWER_ON -> ST_POWER_ON_GRACE
+  on EV_SEATSENSOR_RELEASED
+  start PWR_IDLE_TIMER (60 minute)
+
+ST_POWER_ON_GRACE -> ST_POWER_OFF
+  on EV_PWR_IDLE_TIMER_TIMEOUT
+
+```
+
+### Outputs
+
+```
+ST_POWER_OFF -> OUT_KEY_POWER_PIN = LOW
+ST_POWER_ON  -> OUT_KEY_POWER_PIN = HIGH
+
+```
+
+---
+
+## DRL
+should turn on when the vehicle is powered on via CAN using the button on the VDS display.
+only turn off when the vehicle is powered off via the button / after 1h timeout.
+
+### States
+```
+ST_DRL_OFF      (default / safe)
+ST_DRL_ON
+ST_DRL_ON_GRACE
+```
+
+### Transitions
+
+```
+ST_DRL_OFF -> ST_DRL_ON
+  on EV_POWER_BUTTON_SHORT_CAN
+  on EV_POWER_BUTTON_LONG_CAN 
+
+ST_DRL_ON -> ST_DRL_OFF
+  on EV_POWER_BUTTON_SHORT_CAN
+  on EV_POWER_BUTTON_LONG_CAN 
+
+ST_DRL_ON -> ST_DRL_ON_GRACE
+  on EV_SEATSENSOR_RELEASED
+  start DRL_IDLE_TIMER (60 minute)
+
+ST_DRL_ON_GRACE -> ST_DRL_OFF
+  on EV_DRL_IDLE_TIMER_TIMEOUT
+```
+
+### Outputs
+
+```
+ST_DRL_OFF:
+  CAN_DRL_LEFT  = OFF
+  CAN_DRL_RIGHT = OFF
+
+ST_DRL_ON:
+  CAN_DRL_LEFT  = ON
+  CAN_DRL_RIGHT = ON
+```
+
+---
+
+## low beam
+should turn on when the vehicle is driving via CAN using the button on the VDS display.
+only turn off when the vehicle is stationnary for more than 5 minute or that the VDS display button turn of the vehicle
+
+### States
+```
+ST_LOWBEAM_OFF      (default / safe)
+ST_LOWBEAM_ON
+ST_LOWBEAM_ON_GRACE
+```
+
+### Transitions
+
+```
+ST_LOWBEAM_OFF -> ST_LOWBEAM_ON
+  on EV_DRIVING
+
+
+ST_LOWBEAM_ON -> ST_LOWBEAM_OFF
+  on EV_POWER_BUTTON_SHORT_CAN
+  on EV_POWER_BUTTON_LONG_CAN
+
+
+ST_LOWBEAM_ON -> ST_LOWBEAM_ON_GRACE
+  on EV_STATIONNARY
+  start LOWBEAM_IDLE_TIMER (5 minute)
+
+
+ST_LOWBEAM_ON_GRACE -> ST_LOWBEAM_ON
+  on EV_DRIVING
+
+
+ST_LOWBEAM_ON_GRACE -> ST_LOWBEAM_OFF
+  on EV_LOWBEAM_IDLE_TIMER_TIMEOUT
+
+
+ST_LOWBEAM_ON_GRACE -> ST_LOWBEAM_OFF
+  on EV_POWER_BUTTON_SHORT_CAN
+  on EV_POWER_BUTTON_LONG_CAN
+```
+
+### Outputs
+
+```
+ST_LOWBEAM_OFF:
+  CAN_LOWBEAM_LEFT  = OFF
+  CAN_LOWBEAM_RIGHT = OFF
+
+ST_LOWBEAM_ON:
+  CAN_LOWBEAM_LEFT  = ON
+  CAN_LOWBEAM_RIGHT = ON
+
+ST_LOWBEAM_ON_GRACE:
+  CAN_LOWBEAM_LEFT  = ON
+  CAN_LOWBEAM_RIGHT = ON
+```
+
+---
+
+## FOG LIGHT FSM
+on as un bouton qui nous permet d'allumer/éteidne le phare a brouillard. Il s'agit d'un simple bouton et chaque pression change l'état de on à off.
+Le bouton possede une LED qui indique l'etat actuel.
+l'etat est partagé via CAN pour les lightboard qui allume les lumières exterieur.
+on lis le seat sensor avec un timeout a 2 minute si on quitte le vehicle en oubliant le fog light, il seteint tout seul.
+
+### States
+
+```
+ST_FSM_FOG_OFF        (default / safe)
+ST_FSM_FOG_ON
+ST_FSM_FOG_ON_GRACE
+```
+
+### Transitions
+
+```
+ST_FSM_FOG_OFF -> ST_FSM_FOG_ON
   on EV_BTN_BROUILLARD_SHORT
   on EV_BTN_BROUILLARD_LONG
 
-ST_FOG_ON -> ST_FOG_OFF
+ST_FSM_FOG_ON -> ST_FSM_FOG_ON_GRACE
+  on EV_SEATSENSOR_RELEASED
+  start FOG_ON_TIMER (2 min)
+
+ST_FSM_FOG_ON_GRACE -> ST_FSM_FOG_ON
+  on EV_SEATSENSOR_PRESSED
+
+ST_FSM_FOG_ON_GRACE -> ST_FSM_FOG_OFF
+  on EV_FOG_ON_TIMER_TIMEOUT
+
+ST_FSM_FOG_ON -> ST_FSM_FOG_OFF
   on EV_BTN_BROUILLARD_SHORT
   on EV_BTN_BROUILLARD_LONG
 ```
 
 ### Outputs
 
-```
-ST_FOG_OFF : OUT_CAN_FOG_STATUS = OFF, OUT_BROUILLARD_LED = OFF
-ST_FOG_ON  : OUT_CAN_FOG_STATUS = ON,  OUT_BROUILLARD_LED = ON
-```
+on envoie sur le can periodiquement l'etat. on allume / eteint la led sur le bouton.
 
 ---
 
 ## DEFROSTER FSM
 
+Le defroster s'allume pendant 5 minute quand le bouton est pressé, la led du bouton s'allume aussi.
+si le bouton est pressé pendant que le defroster est actif, alors on arrete le defroster.
+si la batterie est presque vide, le defroster ne s'allume pas/tombe en etat off et le bouton clignote qq fois rapidement pendat 3 secondes.
+
 ### States
 
 ```
-ST_DEFROSTER_OFF        (default)
-ST_DEFROSTER_ON
-ST_DEFROSTER_FAULT_BLINK
+ST_FSM_DEFROSTER_OFF        (default / safe)
+ST_FSM_DEFROSTER_ON
+ST_FSM_DEFROSTER_FAULT_BLINK_OFF
+ST_FSM_DEFROSTER_FAULT_BLINK_ON
 ```
 
 ### Transitions
 
 ```
-ST_DEFROSTER_OFF -> ST_DEFROSTER_ON
+ST_FSM_DEFROSTER_OFF -> ST_FSM_DEFROSTER_ON
+  on EV_BTN_DEFROSTER_SHORT_AND_BATTERY_OK
+  on EV_BTN_DEFROSTER_LONG_AND_BATTERY_OK
+  start DEFROSTER_ON_TIMER (5 min)
+
+ST_FSM_DEFROSTER_ON -> ST_FSM_DEFROSTER_OFF
   on EV_BTN_DEFROSTER_SHORT
   on EV_BTN_DEFROSTER_LONG
-  start DEFROSTER_ON_TIMER (10 min)
+  on EV_DEFROSTER_ON_TIMER_TIMEOUT
 
-ST_DEFROSTER_ON -> ST_DEFROSTER_OFF
-  on EV_BTN_DEFROSTER_SHORT
-  on EV_BTN_DEFROSTER_LONG
-  on EV_DEFROSTER_ON_TIMEOUT
-
-ST_DEFROSTER_ON -> ST_DEFROSTER_FAULT_BLINK
+ST_FSM_DEFROSTER_ON -> ST_FSM_DEFROSTER_FAULT_BLINK_ON
   on EV_BATTERY_BELOW_30_PERCENT
   on EV_DEFROSTER_FAULT
-  start DEFROSTER_FAULT_TIMER (4 sec)
+  start DEFROSTER_FAULT_TIMER (3 sec)
+  start DEFROSTER_BLINK_TIMER (0.4 sec)
 
-ST_DEFROSTER_FAULT_BLINK -> ST_DEFROSTER_OFF
-  on EV_DEFROSTER_FAULT_TIMEOUT
+ST_FSM_DEFROSTER_FAULT_BLINK_ON -> ST_FSM_DEFROSTER_FAULT_BLINK_OFF
+  on EV_DEFROSTER_BLINK_TIMER_TIMEOUT
+  start DEFROSTER_BLINK_TIMER (0.4 sec)
+
+ST_FSM_DEFROSTER_FAULT_BLINK_OFF -> ST_FSM_DEFROSTER_FAULT_BLINK_ON
+  on EV_DEFROSTER_BLINK_TIMER_TIMEOUT
+  start DEFROSTER_BLINK_TIMER (0.4 sec)
+
+ST_FSM_DEFROSTER_FAULT_BLINK_ON -> ST_FSM_DEFROSTER_OFF
+  on EV_DEFROSTER_FAULT_TIMER_TIMEOUT
+
+ST_FSM_DEFROSTER_FAULT_BLINK_OFF -> ST_FSM_DEFROSTER_OFF
+  on EV_DEFROSTER_FAULT_TIMER_TIMEOUT
+
+
 ```
 
 ### Outputs
@@ -174,12 +471,18 @@ ST_DEFROSTER_FAULT_BLINK -> ST_DEFROSTER_OFF
 ```
 ST_DEFROSTER_OFF         : OUT_DEFROSTER_MOSFET = OFF, LED OFF
 ST_DEFROSTER_ON          : OUT_DEFROSTER_MOSFET = ON,  LED ON
-ST_DEFROSTER_FAULT_BLINK : OUT_DEFROSTER_MOSFET = OFF, LED BLINK
+ST_FSM_DEFROSTER_FAULT_BLINK_OFF : OUT_DEFROSTER_MOSFET = OFF, LED OFF
+ST_FSM_DEFROSTER_FAULT_BLINK_ON : OUT_DEFROSTER_MOSFET = OFF, LED ON
 ```
 
 ---
 
 ## CABIN LIGHT FSM
+the light stay on for 1h when the vehicle is stationnary. pressing the button again toggle back the state to off.
+the light turn off if the vehicle speed goes above 5kmh
+if the light is turned on / button pressed while speed is above 5kmh. we keep the  light on as long as the speed is above 5kmh.
+once we cross bellow 5kmh / stationnary, we have a 1h timeout. If the vehicle restart after that, the light turn off.
+pressing the trunk button while stationnary will also turn on the light for a small delay of 5 minute. (if not stationnary, the command is ignored as we dont want to open the trunk while driving.)
 
 ### States
 
@@ -187,125 +490,243 @@ ST_DEFROSTER_FAULT_BLINK : OUT_DEFROSTER_MOSFET = OFF, LED BLINK
 ST_CABINLIGHT_OFF        (default)
 ST_CABINLIGHT_ON
 ST_CABINLIGHT_ON_TRUNK
+ST_CABINLIGHT_ON_DRV
 ```
 
 ### Transitions
 
 ```
 ST_CABINLIGHT_OFF -> ST_CABINLIGHT_ON
-  on EV_BTN_CABLIGHT_SHORT
-  on EV_BTN_CABLIGHT_LONG
-  start CABINLIGHT_LONG_TIMER (60 min)
+  on EV_BTN_CABLIGHT_AND_STATIONNARY
+  start CABINLIGHT_TIMER_LONG (60 min)
+
+ST_CABINLIGHT_OFF -> ST_CABINLIGHT_ON_DRV
+  on EV_BTN_CABLIGHT_AND_DRIVING
 
 ST_CABINLIGHT_OFF -> ST_CABINLIGHT_ON_TRUNK
-  on EV_BTN_TRUNK_SHORT
-  on EV_BTN_TRUNK_LONG
-  start CABINLIGHT_TRUNK_TIMER (5 min)
+  on EV_BTN_TRUNK_AND_STATIONNARY
+  start CABINLIGHT_TIMER_SHORT (5 min)
 
 ST_CABINLIGHT_ON -> ST_CABINLIGHT_OFF
-  on EV_BTN_CABLIGHT_SHORT
-  on EV_BTN_CABLIGHT_LONG
-  on EV_CABINLIGHT_LONG_TIMEOUT
+  on EV_BTN_CABLIGHT_RELEASED
+  on EV_CABINLIGHT_TIMER_LONG_TIMEOUT
+  on EV_DRIVING
+
+ST_CABINLIGHT_ON_DRV -> ST_CABINLIGHT_ON
+  on EV_STATIONNARY
+
+ST_CABINLIGHT_ON_DRV -> ST_CABINLIGHT_OFF
+  on EV_BTN_CABLIGHT_RELEASED
 
 ST_CABINLIGHT_ON_TRUNK -> ST_CABINLIGHT_OFF
-  on EV_BTN_CABLIGHT_SHORT
-  on EV_BTN_CABLIGHT_LONG
-  on EV_CABINLIGHT_TRUNK_TIMEOUT
+  on EV_BTN_CABLIGHT_RELEASED
+  on EV_CABINLIGHT_TIMER_SHORT_TIMEOUT
+```
+
+### Outputs
+
+```
+ST_CABINLIGHT_OFF,      cablight and led feedback are OFF
+ST_CABINLIGHT_ON,       cablight and led feedback are ON
+ST_CABINLIGHT_ON_TRUNK, cablight and led feedback are ON
+ST_CABINLIGHT_ON_DRV,   cablight and led feedback are ON
 ```
 
 ---
 
 ## TRUNK FSM
+we can press the TRUNK button. if we do so while the vehicle is driving, the trunk will not open and the button will blink. otherwise, the button will be powered on for a few seconds while the latch release the trunk.
 
 ### States
 
 ```
 ST_TRUNK_LATCHED        (default)
-ST_TRUNK_LOCKED
 ST_TRUNK_OPENING
-ST_TRUNK_LED_FEEDBACK_ON
-ST_TRUNK_LED_FEEDBACK_ERROR
+ST_TRUNK_BLINK_ON
+ST_TRUNK_BLINK_OFF
 ```
 
 ### Transitions
 
 ```
 ST_TRUNK_LATCHED -> ST_TRUNK_OPENING
-  on EV_BTN_TRUNK_SHORT
-  on EV_BTN_TRUNK_LONG
+  on EV_BTN_TRUNK_RELEASED_AND_STATIONNARY
   start TRUNK_ACTION_TIMER (2 sec)
 
-ST_TRUNK_LATCHED -> ST_TRUNK_LOCKED
-  on EV_VEHICLE_SPEED_ABOVE_5KPH
+ST_TRUNK_OPENING -> ST_TRUNK_LATCHED 
+  on EV_TRUNK_ACTION_TIMER_TIMEOUT
 
-ST_TRUNK_LOCKED -> ST_TRUNK_LATCHED
-  on EV_VEHICLE_SPEED_BELOW_5KPH
+ST_TRUNK_LATCHED -> ST_TRUNK_BLINK_ON
+  on EV_BTN_TRUNK_RELEASED_AND_DRIVING
+  start TRUNK_ERROR_TIMER (3 sec)
+  start TRUNK_BLINK_TIMER (0.4 sec)
 
-ST_TRUNK_LOCKED -> ST_TRUNK_LED_FEEDBACK_ERROR
-  on EV_BTN_TRUNK_SHORT
-  on EV_BTN_TRUNK_LONG
-  start TRUNK_ERROR_TIMER (4 sec)
+ST_TRUNK_BLINK_ON -> ST_TRUNK_BLINK_OFF
+  on EV_TRUNK_BLINK_TIMER_TIMEOUT
+  start TRUNK_BLINK_TIMER (0.4 sec)
 
-ST_TRUNK_OPENING -> ST_TRUNK_LED_FEEDBACK_ON
-  on EV_TRUNK_ACTION_TIMEOUT
-  start TRUNK_ACTION_TIMER (2 sec)
+ST_TRUNK_BLINK_OFF -> ST_TRUNK_BLINK_ON
+  on EV_TRUNK_BLINK_TIMER_TIMEOUT
+  start TRUNK_BLINK_TIMER (0.4 sec)
 
-ST_TRUNK_LED_FEEDBACK_ON -> ST_TRUNK_LATCHED
-  on EV_TRUNK_ACTION_TIMEOUT
+ST_TRUNK_BLINK_ON -> ST_TRUNK_LATCHED
+  on EV_TRUNK_ERROR_TIMER_TIMEOUT
 
-ST_TRUNK_LED_FEEDBACK_ERROR -> ST_TRUNK_LOCKED
-  on EV_TRUNK_ERROR_TIMEOUT
+ST_TRUNK_BLINK_OFF -> ST_TRUNK_LATCHED
+  on EV_TRUNK_ERROR_TIMER_TIMEOUT
+
+```
+### Outputs
+
+```
+ST_TRUNK_LATCHED,   coil is not powered, feedback LED is also off
+ST_TRUNK_OPENING,   coil is powered, feedback LED is on
+ST_TRUNK_BLINK_ON,  coil is not powered, feedback LED is on
+ST_TRUNK_BLINK_OFF, coil is not powered, feedback LED is off
 ```
 
 ---
 
-## WARNING LIGHT FSM
+## BLINKER AND WARNING FSM
+when the warning button is pressed, both side blinker should blink at 4Hz, we press it again to turn off the warnings.
+when left / right blinker is toggled, we blink at 75 bpm
+when in warning, the warning button should blink and the binker feedback on the display + rythmic beeping.
+when the left / right blinker are active, only the correct blinker feedback should blink + rythmic beeping.
+when the seat sensor is released, the blinker should stop but the warning button should keep on until the battery run out.
 
 ### States
 
 ```
-ST_WARNING_OFF      (default)
-ST_WARNING_BLINK
-ST_WARNING_CLEAR
+ST_BLINKER_IDLE (default)
+ST_WARNING_ON
+ST_WARNING_OFF
+ST_BLINKER_RIGHT_OFF
+ST_BLINKER_LEFT_OFF
+ST_BLINKER_RIGHT_ON
+ST_BLINKER_LEFT_ON
 ```
 
 ### Transitions
 
 ```
-ST_WARNING_OFF -> ST_WARNING_BLINK
-  on EV_BTN_WARNING_SHORT
-  on EV_BTN_WARNING_LONG
+ST_BLINKER_IDLE -> ST_BLINKER_LEFT_ON
+  on EV_BTN_BLINKER_LEFT_RELEASED
+  start BLINKER_CYCLE_TIMER (400 ms)
+
+ST_BLINKER_IDLE -> ST_BLINKER_RIGHT_ON
+  on EV_BTN_BLINKER_RIGHT_RELEASED
+  start BLINKER_CYCLE_TIMER (400 ms)
+
+ST_BLINKER_IDLE -> ST_WARNING_ON
+  on EV_BTN_WARNING_RELEASED
+  start WARNING_CYCLE_TIMER (125 ms)
+
+
+ST_BLINKER_LEFT_ON -> ST_BLINKER_LEFT_OFF
+  on EV_BLINKER_CYCLE_TIMEOUT
+  start BLINKER_CYCLE_TIMER
+
+ST_BLINKER_LEFT_OFF -> ST_BLINKER_LEFT_ON
+  on EV_BLINKER_CYCLE_TIMEOUT
+  start BLINKER_CYCLE_TIMER
+
+ST_BLINKER_LEFT_ON -> ST_BLINKER_IDLE
+  on EV_BTN_BLINKER_LEFT_RELEASED
+
+ST_BLINKER_LEFT_OFF -> ST_BLINKER_IDLE
+  on EV_BTN_BLINKER_LEFT_RELEASED
+
+ST_BLINKER_LEFT_ON -> ST_WARNING_ON
+  on EV_BTN_WARNING_RELEASED
   start WARNING_CYCLE_TIMER
 
-ST_WARNING_BLINK -> ST_WARNING_OFF
-  on EV_BTN_WARNING_SHORT
-  on EV_BTN_WARNING_LONG
+ST_BLINKER_LEFT_OFF -> ST_WARNING_ON
+  on EV_BTN_WARNING_RELEASED
+  start WARNING_CYCLE_TIMER
 
-ST_WARNING_BLINK -> ST_WARNING_CLEAR
+ST_BLINKER_LEFT_ON -> ST_BLINKER_IDLE
+  on EV_SEATSENSOR_RELEASED
+
+ST_BLINKER_LEFT_OFF -> ST_BLINKER_IDLE
+  on EV_SEATSENSOR_RELEASED
+
+
+ST_BLINKER_RIGHT_ON -> ST_BLINKER_RIGHT_OFF
+  on EV_BLINKER_CYCLE_TIMEOUT
+  start BLINKER_CYCLE_TIMER
+
+ST_BLINKER_RIGHT_OFF -> ST_BLINKER_RIGHT_ON
+  on EV_BLINKER_CYCLE_TIMEOUT
+  start BLINKER_CYCLE_TIMER
+
+ST_BLINKER_RIGHT_ON -> ST_BLINKER_IDLE
+  on EV_BTN_BLINKER_RIGHT_RELEASED
+
+ST_BLINKER_RIGHT_OFF -> ST_BLINKER_IDLE
+  on EV_BTN_BLINKER_RIGHT_RELEASED
+
+ST_BLINKER_RIGHT_ON -> ST_WARNING_ON
+  on EV_BTN_WARNING_RELEASED
+  start WARNING_CYCLE_TIMER
+
+ST_BLINKER_RIGHT_OFF -> ST_WARNING_ON
+  on EV_BTN_WARNING_RELEASED
+  start WARNING_CYCLE_TIMER
+
+ST_BLINKER_RIGHT_ON -> ST_BLINKER_IDLE
+  on EV_SEATSENSOR_RELEASED
+
+ST_BLINKER_RIGHT_OFF -> ST_BLINKER_IDLE
+  on EV_SEATSENSOR_RELEASED
+
+
+ST_WARNING_ON -> ST_WARNING_OFF
   on EV_WARNING_CYCLE_TIMEOUT
   start WARNING_CYCLE_TIMER
 
-ST_WARNING_CLEAR -> ST_WARNING_OFF
-  on EV_BTN_WARNING_SHORT
-  on EV_BTN_WARNING_LONG
-
-ST_WARNING_CLEAR -> ST_WARNING_BLINK
+ST_WARNING_OFF -> ST_WARNING_ON
   on EV_WARNING_CYCLE_TIMEOUT
   start WARNING_CYCLE_TIMER
+
+ST_WARNING_ON -> ST_BLINKER_IDLE
+  on EV_BTN_WARNING_RELEASED
+
+ST_WARNING_OFF -> ST_BLINKER_IDLE
+  on EV_BTN_WARNING_RELEASED
+
+```
+### Outputs
+
+```
+ST_BLINKER_IDLE (default) -> all off
+ST_WARNING_ON -> CAN left + right and led left + right + warning led feedback + display VSD feedback are ON, audio feedback too
+ST_WARNING_OFF -> CAN left + right and led left + right + warning led feedback + display VSD feedback are OFF, audio feedback OFF
+ST_BLINKER_RIGHT_OFF -> CAN left + right and led left + right + warning led feedback + display VSD feedback are OFF, audio feedback OFF
+ST_BLINKER_LEFT_OFF  -> CAN left + right and led left + right + warning led feedback + display VSD feedback are OFF, audio feedback OFF
+ST_BLINKER_RIGHT_ON  -> CAN right and led right + display VSD feedback right are ON, audio feedback ON
+ST_BLINKER_LEFT_ON   -> CAN left and led left + display VSD feedback left are ON, audio feedback ON
 ```
 
 ---
 
 ## DRIVE DIRECTION FSM (FORWARD / REVERSE)
+using a non latching switch we can select forward / backward.
+I want to be able to select freely forward / backward as long as the speed is bellow a given threshold speed (5kmh)
+If i'm above and I toggle, I want my toggle to be valid for 5 second (if the speed drop bellow the threshold in that time frame we count it otherwise, we ignore it.)
 
 ### States
 
 ```
-ST_DRIVE_NEUTRAL     (default)
+ST_DRIVE_NEUTRAL          (default / safe)
+
 ST_DRIVE_FORWARD
 ST_DRIVE_FORWARD_LOCK
+ST_DRIVE_FWD_PENDING
+
 ST_DRIVE_REVERSE
 ST_DRIVE_REVERSE_LOCK
+ST_DRIVE_REV_PENDING
+
 ```
 
 ### Transitions
@@ -319,45 +740,110 @@ ST_DRIVE_NEUTRAL -> ST_DRIVE_REVERSE
   on EV_BTN_REVERSE_SHORT
   on EV_BTN_REVERSE_LONG
 
+
 ST_DRIVE_FORWARD -> ST_DRIVE_FORWARD_LOCK
   on EV_VEHICLE_SPEED_ABOVE_5KPH
-
-ST_DRIVE_REVERSE -> ST_DRIVE_REVERSE_LOCK
-  on EV_VEHICLE_SPEED_ABOVE_5KPH
-
-ST_DRIVE_FORWARD_LOCK -> ST_DRIVE_FORWARD
-  on EV_VEHICLE_SPEED_BELOW_5KPH
-
-ST_DRIVE_REVERSE_LOCK -> ST_DRIVE_REVERSE
-  on EV_VEHICLE_SPEED_BELOW_5KPH
-
-ST_DRIVE_REVERSE -> ST_DRIVE_FORWARD
-  on EV_BTN_FORWARD_SHORT
-  on EV_BTN_FORWARD_LONG
-  on EV_FORWARD_CHANGE_TIMEOUT
 
 ST_DRIVE_FORWARD -> ST_DRIVE_REVERSE
   on EV_BTN_REVERSE_SHORT
   on EV_BTN_REVERSE_LONG
-  on EV_REVERSE_CHANGE_TIMEOUT
 
-ST_DRIVE_FORWARD_LOCK -> ST_DRIVE_FORWARD_LOCK
+ST_DRIVE_FORWARD -> ST_DRIVE_NEUTRAL
+  on EV_SEATSENSOR_RELEASED
+
+
+ST_DRIVE_FORWARD_LOCK -> ST_DRIVE_FORWARD
+  on EV_VEHICLE_SPEED_BELOW_5KPH
+
+ST_DRIVE_FORWARD_LOCK -> ST_DRIVE_REV_PENDING
   on EV_BTN_REVERSE_SHORT
   on EV_BTN_REVERSE_LONG
-  start REVERSE_CHANGE_TIMER (10 sec)
+  start DRIVE_CHANGE_TIMER (5 sec)
 
-ST_DRIVE_REVERSE_LOCK -> ST_DRIVE_REVERSE_LOCK
+ST_DRIVE_FORWARD_LOCK -> ST_DRIVE_NEUTRAL
+  on EV_SEATSENSOR_RELEASED
+
+
+ST_DRIVE_FWD_PENDING -> ST_DRIVE_FORWARD
+  on EV_VEHICLE_SPEED_BELOW_5KPH
+
+ST_DRIVE_FWD_PENDING -> ST_DRIVE_REVERSE_LOCK
+  on EV_DRIVE_CHANGE_TIMER_TIMEOUT
+
+ST_DRIVE_FWD_PENDING -> ST_DRIVE_REVERSE_LOCK
+  on EV_BTN_REVERSE_SHORT
+  on EV_BTN_REVERSE_LONG
+
+ST_DRIVE_FWD_PENDING -> ST_DRIVE_NEUTRAL
+  on EV_SEATSENSOR_RELEASED
+
+
+ST_DRIVE_REVERSE -> ST_DRIVE_REVERSE_LOCK
+  on EV_VEHICLE_SPEED_ABOVE_5KPH
+
+ST_DRIVE_REVERSE -> ST_DRIVE_FORWARD
   on EV_BTN_FORWARD_SHORT
   on EV_BTN_FORWARD_LONG
-  start FORWARD_CHANGE_TIMER (10 sec)
 
-ANY DRIVE STATE -> ST_DRIVE_NEUTRAL
-  on EV_SEAT_RELEASED_10S
+ST_DRIVE_REVERSE -> ST_DRIVE_NEUTRAL
+  on EV_SEATSENSOR_RELEASED
+
+
+ST_DRIVE_REVERSE_LOCK -> ST_DRIVE_REVERSE
+  on EV_VEHICLE_SPEED_BELOW_5KPH
+
+ST_DRIVE_REVERSE_LOCK -> ST_DRIVE_FWD_PENDING
+  on EV_BTN_FORWARD_SHORT
+  on EV_BTN_FORWARD_LONG
+  start DRIVE_CHANGE_TIMER (5 sec)
+
+ST_DRIVE_REVERSE_LOCK -> ST_DRIVE_NEUTRAL
+  on EV_SEATSENSOR_RELEASED
+
+
+ST_DRIVE_REV_PENDING -> ST_DRIVE_REVERSE
+  on EV_VEHICLE_SPEED_BELOW_5KPH
+
+ST_DRIVE_REV_PENDING -> ST_DRIVE_FORWARD_LOCK
+  on EV_DRIVE_CHANGE_TIMER_TIMEOUT
+
+ST_DRIVE_REV_PENDING -> ST_DRIVE_FORWARD_LOCK
+  on EV_BTN_FORWARD_SHORT
+  on EV_BTN_FORWARD_LONG
+
+ST_DRIVE_REV_PENDING -> ST_DRIVE_NEUTRAL
+  on EV_SEATSENSOR_RELEASED
+
+
+```
+
+### Outputs
+
+```
+
+ST_DRIVE_FORWARD   ->  send CAN to forward motion
+ST_DRIVE_REV_PENDING   -> send CAN to forward motion
+ST_DRIVE_FORWARD_LOCK  -> send CAN to forward motion
+
+ST_DRIVE_NEUTRAL -> send CAN to neutral
+
+ST_DRIVE_REVERSE   -> send CAN to reverse motion
+ST_DRIVE_FWD_PENDING   ->  send CAN to reverse motion
+ST_DRIVE_REVERSE_LOCK  -> send CAN to reverse motion
 ```
 
 ---
 
-## BRAKE FSM (DERIVED)
+## BRAKE FSM
+when the brake switch are pressed we can influence the regen braking.
+by default when no brake is pressed, there is no regen
+when the left brake is pressed, we have 25% of the regen.
+when the right brake is pressed, we have 50% of the regen.
+when both are pressed, we have 100% of the regen braking.
+
+we need to implement a ramp up on the regen braking on the silixcon to make it smooth (and not go from 0 to 100% instantly)
+
+we also need to take this CAN state on the lighboard to light up the brake signal.
 
 ### States
 
@@ -371,11 +857,151 @@ ST_BRAKE_LEVEL_100
 ### Transitions
 
 ```
-ANY -> ST_BRAKE_LEVEL_0    on EV_BRAKE_NONE
-ANY -> ST_BRAKE_LEVEL_25  on EV_BRAKE_LEFT_ONLY
-ANY -> ST_BRAKE_LEVEL_50  on EV_BRAKE_RIGHT_ONLY
-ANY -> ST_BRAKE_LEVEL_100 on EV_BRAKE_BOTH
+ST_BRAKE_LEVEL_0 -> ST_BRAKE_LEVEL_0
+  on EV_BRAKE_NONE
+
+ST_BRAKE_LEVEL_0 -> ST_BRAKE_LEVEL_25
+  on EV_BRAKE_LEFT_ONLY
+
+ST_BRAKE_LEVEL_0 -> ST_BRAKE_LEVEL_50
+  on EV_BRAKE_RIGHT_ONLY
+
+ST_BRAKE_LEVEL_0 -> ST_BRAKE_LEVEL_100
+  on EV_BRAKE_BOTH
+
+
+ST_BRAKE_LEVEL_25 -> ST_BRAKE_LEVEL_0
+  on EV_BRAKE_NONE
+
+ST_BRAKE_LEVEL_25 -> ST_BRAKE_LEVEL_25
+  on EV_BRAKE_LEFT_ONLY
+
+ST_BRAKE_LEVEL_25 -> ST_BRAKE_LEVEL_50
+  on EV_BRAKE_RIGHT_ONLY
+
+ST_BRAKE_LEVEL_25 -> ST_BRAKE_LEVEL_100
+  on EV_BRAKE_BOTH
+
+
+ST_BRAKE_LEVEL_50 -> ST_BRAKE_LEVEL_0
+  on EV_BRAKE_NONE
+
+ST_BRAKE_LEVEL_50 -> ST_BRAKE_LEVEL_25
+  on EV_BRAKE_LEFT_ONLY
+
+ST_BRAKE_LEVEL_50 -> ST_BRAKE_LEVEL_50
+  on EV_BRAKE_RIGHT_ONLY
+
+ST_BRAKE_LEVEL_50 -> ST_BRAKE_LEVEL_100
+  on EV_BRAKE_BOTH
+
+
+ST_BRAKE_LEVEL_100 -> ST_BRAKE_LEVEL_0
+  on EV_BRAKE_NONE
+
+ST_BRAKE_LEVEL_100 -> ST_BRAKE_LEVEL_25
+  on EV_BRAKE_LEFT_ONLY
+
+ST_BRAKE_LEVEL_100 -> ST_BRAKE_LEVEL_50
+  on EV_BRAKE_RIGHT_ONLY
+
+ST_BRAKE_LEVEL_100 -> ST_BRAKE_LEVEL_100
+  on EV_BRAKE_BOTH
 ```
+
+### Outputs
+
+```
+ST_BRAKE_LEVEL_0    -> regen_setpoint = 0%
+ST_BRAKE_LEVEL_25   -> regen_setpoint = 25%
+ST_BRAKE_LEVEL_50   -> regen_setpoint = 50%
+ST_BRAKE_LEVEL_100  -> regen_setpoint = 100%
+```
+
+---
+
+## USB POWER FSM
+
+### States
+
+```
+ST_USB_OFF     (default)
+ST_USB_POWERED
+ST_USB_GRACE
+```
+
+### Transitions
+
+```
+ST_USB_OFF -> ST_USB_POWERED
+  on EV_SEAT_PRESSED
+
+ST_USB_POWERED -> ST_USB_GRACE
+  on EV_SEAT_RELEASED_10S
+  start USB_GRACE_TIMER (30 min)
+
+ST_USB_GRACE -> ST_USB_OFF
+  on EV_USB_GRACE_TIMEOUT
+
+ST_USB_GRACE -> ST_USB_POWERED
+  on EV_SEAT_PRESSED
+```
+### Outputs
+
+---
+
+## AUDIO OUTPUT
+
+### States
+
+```
+ST_AUDIOAUX_OFF     (default)
+ST_AUDIOAUX_POWERED
+ST_AUDIOAUX_GRACE
+```
+
+### Transitions
+
+```
+ST_USB_OFF -> ST_USB_POWERED
+  on EV_SEAT_PRESSED
+
+ST_USB_POWERED -> ST_USB_GRACE
+  on EV_SEAT_RELEASED
+  start USB_GRACE_TIMER (5 sec)
+
+ST_USB_GRACE -> ST_USB_OFF
+  on EV_USB_GRACE_TIMEOUT
+
+ST_USB_GRACE -> ST_USB_POWERED
+  on EV_SEAT_PRESSED
+```
+### Outputs
+
+---
+
+
+## MAPPING BUTTON FSM
+
+### States
+
+```
+ST_MAPPING_CLEAR   (default)
+ST_MAPPING_PRESSED
+```
+
+### Transitions
+
+```
+ST_MAPPING_CLEAR -> ST_MAPPING_PRESSED
+  on EV_BTN_MAPPING_SHORT
+  on EV_BTN_MAPPING_LONG
+  start MAPPING_BUTTON_TIMER (2 sec)
+
+ST_MAPPING_PRESSED -> ST_MAPPING_CLEAR
+  on EV_MAPPING_BUTTON_TIMEOUT
+```
+### Outputs
 
 ---
 
@@ -411,6 +1037,8 @@ ST_SEATHEATER_ON -> ST_SEATHEATER_STANDBY
   on EV_BTN_SEATHEATER_SHORT
   on EV_SEATHEATER_ON_TIMEOUT
 ```
+
+### Outputs
 
 ---
 
@@ -454,6 +1082,8 @@ ST_HANDHEATER_EDITION -> ST_HANDHEATER_EDITION
   on EV_ROT_HANDHEATER_INC
   on EV_ROT_HANDHEATER_DEC
 ```
+### Outputs
+
 
 ---
 
@@ -475,77 +1105,10 @@ ST_SPEED_LIMIT_EDITION -> ST_ASSIST_COEFF_EDITION
 ST_ASSIST_COEFF_EDITION -> ST_SPEED_LIMIT_EDITION
   on EV_BTN_SPEEDLIMIT_SHORT
 ```
+### Outputs
+
 
 ---
-
-## MAPPING BUTTON FSM
-
-### States
-
-```
-ST_MAPPING_CLEAR   (default)
-ST_MAPPING_PRESSED
-```
-
-### Transitions
-
-```
-ST_MAPPING_CLEAR -> ST_MAPPING_PRESSED
-  on EV_BTN_MAPPING_SHORT
-  on EV_BTN_MAPPING_LONG
-  start MAPPING_BUTTON_TIMER (2 sec)
-
-ST_MAPPING_PRESSED -> ST_MAPPING_CLEAR
-  on EV_MAPPING_BUTTON_TIMEOUT
-```
-
----
-
-## USB POWER FSM
-
-### States
-
-```
-ST_USB_OFF     (default)
-ST_USB_POWERED
-ST_USB_GRACE
-```
-
-### Transitions
-
-```
-ST_USB_OFF -> ST_USB_POWERED
-  on EV_SEAT_PRESSED
-
-ST_USB_POWERED -> ST_USB_GRACE
-  on EV_SEAT_RELEASED_10S
-  start USB_GRACE_TIMER (30 min)
-
-ST_USB_GRACE -> ST_USB_OFF
-  on EV_USB_GRACE_TIMEOUT
-```
-
----
-
-## AUDIO OUTPUT
-
-```
-OUT_AUXAUDIO_GATE = ON  while seat is pressed
-OUT_AUXAUDIO_GATE = OFF on EV_SEAT_RELEASED_10S
-```
-
----
-
-## DRL / BLINKERS
-
-```
-OUT_DRL_LEFT  = CAN_DRL_LEFT
-OUT_DRL_RIGHT = CAN_DRL_RIGHT
-
-OUT_BLINKER_LEFT  = CAN_BLINKER_LEFT
-OUT_BLINKER_RIGHT = CAN_BLINKER_RIGHT
-```
-
 
 
 ### RGB backlight
@@ -564,260 +1127,3 @@ STATE TEMPERATURE_WARM
 STATE TEMPERATURE_HOT
 STATE TEMPERATURE_INFERNO
 
-
-
-## RAW INPUTS (IN_)
-
-```
-IN_THROTTLE_ANALOG
-IN_EXT_INTERRUPT
-
-IN_POT_SPEED_A
-IN_POT_SPEED_B
-IN_POT_SEATHEATER_A
-IN_POT_SEATHEATER_B
-IN_POT_HANDHEATER_A
-IN_POT_HANDHEATER_B
-
-IN_POT_SPEED_SW
-IN_POT_SEATHEATER_SW
-IN_POT_HANDHEATER_SW
-
-IN_BTN_DEFROSTER
-IN_BTN_TRUNK
-IN_BTN_CABLIGHT
-IN_BTN_WARNING
-IN_BTN_FORWARD
-IN_BTN_REVERSE
-IN_BTN_MAPPING
-
-IN_BTN_BRAKE_LEFT
-IN_BTN_BRAKE_RIGHT
-
-IN_SEAT_SENSOR
-
-IN_ALERT_DEFROSTER
-IN_ALERT_HANDHEATER
-IN_ALERT_SEATHEATER
-IN_ALERT_POWERINPUT
-```
-
----
-
-## EVENTS (EV_)
-
-```
-EV_BTN_DEFROSTER_SHORT
-EV_BTN_DEFROSTER_LONG
-EV_BTN_TRUNK_SHORT
-EV_BTN_TRUNK_LONG
-EV_BTN_CABLIGHT_SHORT
-EV_BTN_CABLIGHT_LONG
-EV_BTN_WARNING_SHORT
-EV_BTN_WARNING_LONG
-EV_BTN_FORWARD_SHORT
-EV_BTN_FORWARD_LONG
-EV_BTN_REVERSE_SHORT
-EV_BTN_REVERSE_LONG
-EV_BTN_MAPPING_SHORT
-EV_BTN_MAPPING_LONG
-
-EV_ROT_SPEED_INC
-EV_ROT_SPEED_DEC
-EV_ROT_SEATHEATER_INC
-EV_ROT_SEATHEATER_DEC
-EV_ROT_HANDHEATER_INC
-EV_ROT_HANDHEATER_DEC
-
-EV_VEHICLE_SPEED_ABOVE_5KPH
-EV_VEHICLE_SPEED_BELOW_5KPH
-EV_BATTERY_BELOW_30_PERCENT
-
-EV_SEAT_PRESSED
-EV_SEAT_RELEASED_10S
-
-EV_BRAKE_NONE
-EV_BRAKE_LEFT_ONLY
-EV_BRAKE_RIGHT_ONLY
-EV_BRAKE_BOTH
-
-EV_DEFROSTER_FAULT
-EV_HANDHEATER_FAULT
-EV_SEATHEATER_FAULT
-EV_POWERINPUT_FAULT
-
-EV_DEFROSTER_ON_TIMEOUT
-EV_DEFROSTER_FAULT_TIMEOUT
-EV_CABINLIGHT_LONG_TIMEOUT
-EV_CABINLIGHT_TRUNK_TIMEOUT
-EV_TRUNK_ACTION_TIMEOUT
-EV_TRUNK_ERROR_TIMEOUT
-EV_WARNING_CYCLE_TIMEOUT
-EV_FORWARD_CHANGE_TIMEOUT
-EV_REVERSE_CHANGE_TIMEOUT
-EV_SEATHEATER_EDIT_TIMEOUT
-EV_SEATHEATER_ON_TIMEOUT
-EV_HANDHEATER_EDIT_TIMEOUT
-EV_HANDHEATER_ON_TIMEOUT
-EV_MAPPING_BUTTON_TIMEOUT
-EV_USB_GRACE_TIMEOUT
-```
-
----
-
-## FSM STATES (ST_)
-
-### FOG LIGHT
-
-```
-ST_FOG_OFF
-ST_FOG_ON
-```
-
-### DEFROSTER
-
-```
-ST_DEFROSTER_OFF
-ST_DEFROSTER_ON
-ST_DEFROSTER_FAULT_BLINK
-```
-
-### CABIN LIGHT
-
-```
-ST_CABINLIGHT_OFF
-ST_CABINLIGHT_ON
-ST_CABINLIGHT_ON_TRUNK
-```
-
-### TRUNK
-
-```
-ST_TRUNK_LOCKED
-ST_TRUNK_LATCHED
-ST_TRUNK_OPENING
-ST_TRUNK_LED_FEEDBACK_ON
-ST_TRUNK_LED_FEEDBACK_ERROR
-```
-
-### WARNING LIGHTS
-
-```
-ST_WARNING_OFF
-ST_WARNING_BLINK
-ST_WARNING_CLEAR
-```
-
-### DRIVE DIRECTION
-
-```
-ST_DRIVE_NEUTRAL
-ST_DRIVE_FORWARD
-ST_DRIVE_FORWARD_LOCK
-ST_DRIVE_REVERSE
-ST_DRIVE_REVERSE_LOCK
-```
-
-### BRAKE
-
-```
-ST_BRAKE_LEVEL_0
-ST_BRAKE_LEVEL_25
-ST_BRAKE_LEVEL_50
-ST_BRAKE_LEVEL_100
-```
-
-### SEAT HEATER
-
-```
-ST_SEATHEATER_STANDBY
-ST_SEATHEATER_EDITION
-ST_SEATHEATER_ON
-```
-
-### HAND HEATER
-
-```
-ST_HANDHEATER_STANDBY
-ST_HANDHEATER_EDITION
-ST_HANDHEATER_ON
-```
-
-### SPEED LIMITER
-
-```
-ST_SPEED_LIMIT_EDITION
-ST_ASSIST_COEFF_EDITION
-```
-
-### MAPPING BUTTON
-
-```
-ST_MAPPING_CLEAR
-ST_MAPPING_PRESSED
-```
-
-### USB POWER
-
-```
-ST_USB_OFF
-ST_USB_POWERED
-ST_USB_GRACE
-```
-
-### RGB BACKLIGHT
-
-```
-ST_RGB_MAPPING_1
-ST_RGB_MAPPING_2
-ST_RGB_MAPPING_3
-ST_RGB_MAPPING_4
-ST_RGB_MAPPING_5
-
-ST_RGB_TEMP_LOW
-ST_RGB_TEMP_MEDIUM
-ST_RGB_TEMP_WARM
-ST_RGB_TEMP_HOT
-ST_RGB_TEMP_INFERNO
-```
-
----
-
-## OUTPUTS (OUT_)
-
-```
-OUT_DEFROSTER_MOSFET
-OUT_CABINLIGHT_MOSFET
-OUT_HANDHEATER_MOSFET
-OUT_SEATHEATER_MOSFET
-
-OUT_BLINKER_LEFT
-OUT_BLINKER_RIGHT
-OUT_DRL_LEFT
-OUT_DRL_RIGHT
-
-OUT_WARNING_LED
-OUT_CABLIGHT_LED
-OUT_DEFROST_LED
-OUT_TRUNK_LED
-OUT_BROUILLARD_LED
-OUT_MAP_LED
-
-OUT_AUXAUDIO_GATE
-OUT_AUXUSB_GATE
-OUT_TRUNK_LATCH_GATE
-OUT_POWER_GATE
-
-OUT_RGB_BACKLIGHT
-
-OUT_CAN_FOG_STATUS
-OUT_CAN_WARNING_STATUS
-OUT_CAN_DRIVE_DIRECTION
-OUT_CAN_SPEED_LIMIT
-OUT_CAN_ASSIST_COEFF
-
-OUT_PID_SEATHEATER_DUTY
-OUT_PID_HANDHEATER_DUTY
-
-OUT_BEEP
-```
