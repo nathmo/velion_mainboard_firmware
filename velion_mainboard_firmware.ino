@@ -14,29 +14,53 @@
  *   - Adafruit MPU6050
  *   - Adafruit BMP280
  *   - Adafruit INA228
+ *   - AceButton (by Brian T. Park)
  *   - ESP32 board package v2.0.17 (includes driver/twai.h)
+ *   - WiFi + WebServer (built-in ESP32)
  */
 
 #include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <Adafruit_MCP23X17.h>
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_BMP280.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_INA228.h>
+#include <AceButton.h>
 #include "driver/twai.h"
+
+using namespace ace_button;
 
 // ═══════════════════════════════════════════════════════════════════
 //  FORWARD DECLARATIONS (required for Arduino IDE prototype generation)
 // ═══════════════════════════════════════════════════════════════════
-struct ButtonState;
 struct SoftTimer;
 struct Events;
-void btnReset(ButtonState &b);
-void btnUpdate(ButtonState &b, bool rawNow);
 void timerStart(SoftTimer &t, uint32_t ms);
 void timerStop(SoftTimer &t);
 bool timerExpired(SoftTimer &t);
+
+// ═══════════════════════════════════════════════════════════════════
+//  WIFI HOTSPOT & WEB SERVER CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
+#define WIFI_SSID     "Velion-Dashboard"
+#define WIFI_PASSWORD "velion1234"
+
+WebServer webServer(80);
+
+// CAN packet log ring buffer for the web terminal
+#define CAN_LOG_SIZE 200
+String canLog[CAN_LOG_SIZE];
+int    canLogHead = 0;
+int    canLogCount = 0;
+
+void canLogPush(const String &line) {
+  canLog[canLogHead] = line;
+  canLogHead = (canLogHead + 1) % CAN_LOG_SIZE;
+  if (canLogCount < CAN_LOG_SIZE) canLogCount++;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  PIN DEFINITIONS (HAL)
@@ -153,62 +177,141 @@ bool mpu_ok = false, bmp_ok = false;
 #define SPEED_THRESHOLD_KPH  5
 
 // ═══════════════════════════════════════════════════════════════════
-//  BUTTON DEBOUNCE — simple edge detect with debounce
+//  ACEBUTTON — MCP23017 virtual buttons via manual injection
+//
+//  AceButton normally reads digitalRead(); for MCP-attached buttons
+//  we subclass ButtonConfig to read from the MCP expanders, then
+//  let AceButton do debounce + short/long press detection.
 // ═══════════════════════════════════════════════════════════════════
-#define BTN_DEBOUNCE_MS    30
-#define BTN_LONG_PRESS_MS  800
 
-struct ButtonState {
-  bool     raw;           // current debounced level (true = pressed)
-  bool     prevRaw;       // previous cycle
-  uint32_t pressTime;     // millis when pressed
-  bool     shortRelease;  // one-shot
-  bool     longRelease;   // one-shot
-  bool     pressed;       // one-shot on press
-  bool     released;      // one-shot on release (don't care long/short)
-  uint32_t lastChange;
+// One-shot event flags produced by AceButton callbacks
+struct BtnEvents {
+  bool shortPress;
+  bool longPress;
+  bool pressed;
+  bool released;
 };
 
-ButtonState btnMap       = {};
-ButtonState btnTrunk     = {};
-ButtonState btnDefrost   = {};
-ButtonState btnCablight  = {};
-ButtonState btnBrouillard = {};
-ButtonState btnWarning   = {};
-ButtonState btnForward   = {};
-ButtonState btnReverse   = {};
-ButtonState btnSeat      = {};
-ButtonState btnBrakeLeft = {};
-ButtonState btnBrakeRight = {};
+BtnEvents bevMap        = {};
+BtnEvents bevTrunk      = {};
+BtnEvents bevDefrost    = {};
+BtnEvents bevCablight   = {};
+BtnEvents bevBrouillard = {};
+BtnEvents bevWarning    = {};
+BtnEvents bevForward    = {};
+BtnEvents bevReverse    = {};
+BtnEvents bevSeat       = {};
+BtnEvents bevBrakeLeft  = {};
+BtnEvents bevBrakeRight = {};
 
-void btnReset(ButtonState &b) {
-  b.shortRelease = false;
-  b.longRelease  = false;
-  b.pressed      = false;
-  b.released     = false;
+void bevReset(BtnEvents &b) {
+  b.shortPress = false;
+  b.longPress  = false;
+  b.pressed    = false;
+  b.released   = false;
 }
 
-void btnUpdate(ButtonState &b, bool rawNow) {
-  uint32_t now = millis();
-  if (rawNow != b.raw) {
-    if (now - b.lastChange > BTN_DEBOUNCE_MS) {
-      b.prevRaw    = b.raw;
-      b.raw        = rawNow;
-      b.lastChange = now;
+// ── MCP-aware ButtonConfig ──────────────────────────────────────
+// Since buttons are on MCP expanders (not ESP32 GPIOs), we use
+// checkState() for manual level injection. The pin parameter is
+// unused; we use the AceButton `id` field to identify each button.
 
-      if (b.raw && !b.prevRaw) {          // press edge
-        b.pressed   = true;
-        b.pressTime = now;
-      }
-      if (!b.raw && b.prevRaw) {          // release edge
-        b.released = true;
-        uint32_t held = now - b.pressTime;
-        if (held >= BTN_LONG_PRESS_MS) b.longRelease  = true;
-        else                           b.shortRelease = true;
-      }
+enum ButtonId : uint8_t {
+  BTN_ID_MAP = 0,
+  BTN_ID_TRUNK,
+  BTN_ID_DEFROST,
+  BTN_ID_CABLIGHT,
+  BTN_ID_BROUILLARD,
+  BTN_ID_WARNING,
+  BTN_ID_FORWARD,
+  BTN_ID_REVERSE,
+  BTN_ID_SEAT,
+  BTN_ID_BRAKE_LEFT,
+  BTN_ID_BRAKE_RIGHT,
+  BTN_ID_COUNT
+};
+
+class McpButtonConfig : public ButtonConfig {
+  public:
+    int readButton(uint8_t /*pin*/) override {
+      // We don't use readButton(); we call AceButton::checkState() directly.
+      return HIGH;  // default idle = not pressed
     }
+};
+
+McpButtonConfig mcpBtnConfig;
+
+// Declare AceButton instances — pin=0 (unused), defaultReleased=HIGH, id=ButtonId
+AceButton abMap       (&mcpBtnConfig, 0, HIGH, BTN_ID_MAP);
+AceButton abTrunk     (&mcpBtnConfig, 0, HIGH, BTN_ID_TRUNK);
+AceButton abDefrost   (&mcpBtnConfig, 0, HIGH, BTN_ID_DEFROST);
+AceButton abCablight  (&mcpBtnConfig, 0, HIGH, BTN_ID_CABLIGHT);
+AceButton abBrouillard(&mcpBtnConfig, 0, HIGH, BTN_ID_BROUILLARD);
+AceButton abWarning   (&mcpBtnConfig, 0, HIGH, BTN_ID_WARNING);
+AceButton abForward   (&mcpBtnConfig, 0, HIGH, BTN_ID_FORWARD);
+AceButton abReverse   (&mcpBtnConfig, 0, HIGH, BTN_ID_REVERSE);
+AceButton abSeat      (&mcpBtnConfig, 0, HIGH, BTN_ID_SEAT);
+AceButton abBrakeLeft (&mcpBtnConfig, 0, HIGH, BTN_ID_BRAKE_LEFT);
+AceButton abBrakeRight(&mcpBtnConfig, 0, HIGH, BTN_ID_BRAKE_RIGHT);
+
+// Lookup table: id → BtnEvents*
+BtnEvents* bevTable[BTN_ID_COUNT];
+
+void initBevTable() {
+  bevTable[BTN_ID_MAP]         = &bevMap;
+  bevTable[BTN_ID_TRUNK]       = &bevTrunk;
+  bevTable[BTN_ID_DEFROST]     = &bevDefrost;
+  bevTable[BTN_ID_CABLIGHT]    = &bevCablight;
+  bevTable[BTN_ID_BROUILLARD]  = &bevBrouillard;
+  bevTable[BTN_ID_WARNING]     = &bevWarning;
+  bevTable[BTN_ID_FORWARD]     = &bevForward;
+  bevTable[BTN_ID_REVERSE]     = &bevReverse;
+  bevTable[BTN_ID_SEAT]        = &bevSeat;
+  bevTable[BTN_ID_BRAKE_LEFT]  = &bevBrakeLeft;
+  bevTable[BTN_ID_BRAKE_RIGHT] = &bevBrakeRight;
+}
+
+// AceButton event handler (all buttons share this)
+void handleButtonEvent(AceButton* button, uint8_t eventType, uint8_t /*buttonState*/) {
+  uint8_t id = button->getId();
+  if (id >= BTN_ID_COUNT) return;
+  BtnEvents* bev = bevTable[id];
+  if (!bev) return;
+
+  switch (eventType) {
+    case AceButton::kEventPressed:
+      bev->pressed = true;
+      break;
+    case AceButton::kEventReleased:
+      bev->released   = true;
+      bev->shortPress = true;
+      break;
+    case AceButton::kEventLongPressed:
+      bev->longPress = true;
+      break;
+    case AceButton::kEventLongReleased:
+      bev->released  = true;
+      bev->longPress = true;
+      break;
   }
 }
+
+void setupAceButtons() {
+  initBevTable();
+
+  mcpBtnConfig.setEventHandler(handleButtonEvent);
+  mcpBtnConfig.setFeature(ButtonConfig::kFeatureLongPress);
+  mcpBtnConfig.setFeature(ButtonConfig::kFeatureSuppressAfterLongPress);
+  mcpBtnConfig.setDebounceDelay(30);
+  mcpBtnConfig.setLongPressDelay(800);
+
+  Serial.println("[BTN] AceButton x11 configured (MCP checkState injection)");
+}
+
+// Raw level booleans (kept for brake composite in generateEvents)
+bool rawBrakeLeft  = false;
+bool rawBrakeRight = false;
+bool rawSeat       = false;
 
 // ═══════════════════════════════════════════════════════════════════
 //  EVENT FLAGS  (cleared every loop cycle)
@@ -599,6 +702,213 @@ void setupGPIO() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  WIFI AP + WEB SERVER
+// ═══════════════════════════════════════════════════════════════════
+
+// Helper: FSM enum → readable string
+const char* mappingStateName(MappingState s) {
+  switch (s) { case ST_MAPPING_CLEAR: return "CLEAR"; case ST_MAPPING_PRESSED: return "PRESSED"; } return "?";
+}
+const char* cabinLightStateName(CabinLightState s) {
+  switch (s) { case ST_CABINLIGHT_OFF: return "OFF"; case ST_CABINLIGHT_ON: return "ON";
+    case ST_CABINLIGHT_ON_TRUNK: return "ON_TRUNK"; case ST_CABINLIGHT_ON_DRV: return "ON_DRV"; } return "?";
+}
+const char* trunkStateName(TrunkState s) {
+  switch (s) { case ST_TRUNK_LATCHED: return "LATCHED"; case ST_TRUNK_OPENING: return "OPENING";
+    case ST_TRUNK_BLINK_ON: return "BLINK_ON"; case ST_TRUNK_BLINK_OFF: return "BLINK_OFF"; } return "?";
+}
+const char* fogStateName(FogState s) {
+  switch (s) { case ST_FSM_FOG_OFF: return "OFF"; case ST_FSM_FOG_ON: return "ON";
+    case ST_FSM_FOG_ON_GRACE: return "ON_GRACE"; } return "?";
+}
+const char* defrosterStateName(DefrosterState s) {
+  switch (s) { case ST_FSM_DEFROSTER_OFF: return "OFF"; case ST_FSM_DEFROSTER_ON: return "ON";
+    case ST_FSM_DEFROSTER_FAULT_BLINK_OFF: return "FAULT_BLINK_OFF";
+    case ST_FSM_DEFROSTER_FAULT_BLINK_ON: return "FAULT_BLINK_ON"; } return "?";
+}
+const char* blinkerStateName(BlinkerState s) {
+  switch (s) { case ST_BLINKER_IDLE: return "IDLE";
+    case ST_WARNING_ON: return "WARNING_ON"; case ST_WARNING_OFF: return "WARNING_OFF";
+    case ST_BLINKER_LEFT_ON: return "LEFT_ON"; case ST_BLINKER_LEFT_OFF: return "LEFT_OFF";
+    case ST_BLINKER_RIGHT_ON: return "RIGHT_ON"; case ST_BLINKER_RIGHT_OFF: return "RIGHT_OFF"; } return "?";
+}
+const char* driveStateName(DriveState s) {
+  switch (s) { case ST_DRIVE_NEUTRAL: return "NEUTRAL";
+    case ST_DRIVE_FORWARD: return "FORWARD"; case ST_DRIVE_FORWARD_LOCK: return "FORWARD_LOCK";
+    case ST_DRIVE_FWD_PENDING: return "FWD_PENDING";
+    case ST_DRIVE_REVERSE: return "REVERSE"; case ST_DRIVE_REVERSE_LOCK: return "REVERSE_LOCK";
+    case ST_DRIVE_REV_PENDING: return "REV_PENDING"; } return "?";
+}
+const char* brakeStateName(BrakeState s) {
+  switch (s) { case ST_BRAKE_LEVEL_0: return "0%"; case ST_BRAKE_LEVEL_25: return "25%";
+    case ST_BRAKE_LEVEL_50: return "50%"; case ST_BRAKE_LEVEL_100: return "100%"; } return "?";
+}
+const char* powerStateName(PowerState s) {
+  switch (s) { case ST_POWER_OFF: return "OFF"; case ST_POWER_ON: return "ON";
+    case ST_POWER_ON_GRACE: return "ON_GRACE"; } return "?";
+}
+const char* drlStateName(DrlState s) {
+  switch (s) { case ST_DRL_OFF: return "OFF"; case ST_DRL_ON: return "ON";
+    case ST_DRL_ON_GRACE: return "ON_GRACE"; } return "?";
+}
+const char* lowbeamStateName(LowbeamState s) {
+  switch (s) { case ST_LOWBEAM_OFF: return "OFF"; case ST_LOWBEAM_ON: return "ON";
+    case ST_LOWBEAM_ON_GRACE: return "ON_GRACE"; } return "?";
+}
+
+// ── Serve main dashboard page ────────────────────────────────────
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Velion Dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:12px}
+  h1{text-align:center;color:#58a6ff;margin-bottom:12px;font-size:1.4em}
+  h2{color:#58a6ff;font-size:1.05em;margin:8px 0 4px;border-bottom:1px solid #21262d;padding-bottom:4px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px}
+  table{width:100%;border-collapse:collapse}
+  td{padding:3px 6px;border-bottom:1px solid #21262d;font-size:0.9em}
+  td:first-child{color:#8b949e;width:45%}
+  .on{color:#3fb950;font-weight:bold}
+  .off{color:#8b949e}
+  #term{background:#010409;border:1px solid #30363d;border-radius:8px;
+        padding:8px;font-family:'Cascadia Code',monospace;font-size:0.82em;
+        height:340px;overflow-y:auto;white-space:pre;color:#7ee787;margin-top:10px}
+  .status-bar{text-align:center;font-size:0.8em;color:#484f58;margin-top:8px}
+</style></head><body>
+<h1>⚡ Velion Mainboard Dashboard</h1>
+<div class="grid" id="cards"></div>
+<h2>🖥️ CAN Bus Terminal</h2>
+<div id="term"></div>
+<div class="status-bar">Auto-refresh every 1 s &mdash; WiFi AP: Velion-Dashboard</div>
+<script>
+function cls(v){return (v==='OFF'||v==='IDLE'||v==='NEUTRAL'||v==='CLEAR'||v==='0%')?'off':'on';}
+function row(l,v){return '<tr><td>'+l+'</td><td class="'+cls(v)+'">'+v+'</td></tr>';}
+function buildCards(d){
+  let h='';
+  // FSM card
+  h+='<div class="card"><h2>🔄 State Machines</h2><table>';
+  h+=row('Power',d.power); h+=row('Drive',d.drive); h+=row('Brake',d.brake);
+  h+=row('DRL',d.drl); h+=row('Low Beam',d.lowbeam); h+=row('Blinker',d.blinker);
+  h+=row('Cabin Light',d.cabinLight); h+=row('Fog',d.fog);
+  h+=row('Defroster',d.defroster); h+=row('Trunk',d.trunk); h+=row('Mapping',d.mapping);
+  h+='</table></div>';
+  // Vehicle card
+  h+='<div class="card"><h2>🚗 Vehicle (CAN)</h2><table>';
+  h+=row('Speed',d.speed+' km/h'); h+=row('Battery SOC',d.soc+'%');
+  h+=row('Battery Voltage',d.vbat+' V'); h+=row('Battery Current',d.ibat+' A');
+  h+=row('LYNX Mode',d.lynxMode); h+=row('Power Map',d.currentMap);
+  h+='</table></div>';
+  // Inputs card
+  h+='<div class="card"><h2>🎛️ Inputs</h2><table>';
+  h+=row('Seat Sensor',d.seat?'OCCUPIED':'EMPTY');
+  h+=row('Brake Left',d.brakeL?'PRESSED':'Released');
+  h+=row('Brake Right',d.brakeR?'PRESSED':'Released');
+  h+=row('Throttle ADC',d.throttle);
+  h+='</table></div>';
+  // Peripherals card
+  h+='<div class="card"><h2>🔌 Peripherals</h2><table>';
+  h+=row('MCP1 (0x21)',d.mcp1?'OK':'FAIL');
+  h+=row('MCP2 (0x20)',d.mcp2?'OK':'FAIL');
+  h+=row('INA Main',d.inaMain?'OK':'FAIL');
+  h+=row('INA Hand',d.inaHand?'OK':'FAIL');
+  h+=row('INA Seat',d.inaSeat?'OK':'FAIL');
+  h+=row('INA Defrost',d.inaDef?'OK':'FAIL');
+  h+=row('MPU6050',d.mpu?'OK':'FAIL');
+  h+=row('BMP280',d.bmp?'OK':'FAIL');
+  h+=row('Uptime',d.uptime+' s');
+  h+='</table></div>';
+  document.getElementById('cards').innerHTML=h;
+}
+function updateTerm(lines){
+  let t=document.getElementById('term');
+  t.textContent=lines.join('\n');
+  t.scrollTop=t.scrollHeight;
+}
+async function poll(){
+  try{
+    let r=await fetch('/api/state');let d=await r.json();buildCards(d);
+    let r2=await fetch('/api/can');let d2=await r2.json();updateTerm(d2.lines);
+  }catch(e){}
+}
+setInterval(poll,1000);
+poll();
+</script></body></html>
+)rawliteral";
+  webServer.send(200, "text/html", html);
+}
+
+// ── JSON API: state ──────────────────────────────────────────────
+void handleApiState() {
+  char json[800];
+  snprintf(json, sizeof(json),
+    "{\"power\":\"%s\",\"drive\":\"%s\",\"brake\":\"%s\","
+    "\"drl\":\"%s\",\"lowbeam\":\"%s\",\"blinker\":\"%s\","
+    "\"cabinLight\":\"%s\",\"fog\":\"%s\",\"defroster\":\"%s\","
+    "\"trunk\":\"%s\",\"mapping\":\"%s\","
+    "\"speed\":%d,\"soc\":%d,\"vbat\":\"%.1f\",\"ibat\":\"%.1f\","
+    "\"lynxMode\":%d,\"currentMap\":%d,"
+    "\"seat\":%s,\"brakeL\":%s,\"brakeR\":%s,"
+    "\"throttle\":%d,"
+    "\"mcp1\":%s,\"mcp2\":%s,"
+    "\"inaMain\":%s,\"inaHand\":%s,\"inaSeat\":%s,\"inaDef\":%s,"
+    "\"mpu\":%s,\"bmp\":%s,"
+    "\"uptime\":%lu}",
+    powerStateName(fsmPower), driveStateName(fsmDrive), brakeStateName(fsmBrake),
+    drlStateName(fsmDrl), lowbeamStateName(fsmLowbeam), blinkerStateName(fsmBlinker),
+    cabinLightStateName(fsmCabinLight), fogStateName(fsmFog), defrosterStateName(fsmDefroster),
+    trunkStateName(fsmTrunk), mappingStateName(fsmMapping),
+    vehicleSpeedKph, batterySocPct,
+    batteryVoltage01V * 0.01f, batteryCurrent02A * 0.02f,
+    lynxMode, currentMap,
+    rawSeat ? "true" : "false",
+    rawBrakeLeft ? "true" : "false",
+    rawBrakeRight ? "true" : "false",
+    analogRead(THROTTLE_INPUT),
+    mcp1_ok ? "true" : "false", mcp2_ok ? "true" : "false",
+    inaMain_ok ? "true" : "false", inaHand_ok ? "true" : "false",
+    inaSeat_ok ? "true" : "false", inaDef_ok ? "true" : "false",
+    mpu_ok ? "true" : "false", bmp_ok ? "true" : "false",
+    (unsigned long)(millis() / 1000)
+  );
+  webServer.send(200, "application/json", json);
+}
+
+// ── JSON API: CAN log ────────────────────────────────────────────
+void handleApiCan() {
+  String out = "{\"lines\":[";
+  int start = (canLogCount < CAN_LOG_SIZE) ? 0 : canLogHead;
+  int count = canLogCount;
+  for (int i = 0; i < count; i++) {
+    int idx = (start + i) % CAN_LOG_SIZE;
+    if (i > 0) out += ",";
+    // Escape quotes in the log line
+    String escaped = canLog[idx];
+    escaped.replace("\"", "\\\"");
+    out += "\"" + escaped + "\"";
+  }
+  out += "]}";
+  webServer.send(200, "application/json", out);
+}
+
+void setupWiFiAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+  delay(100);
+  Serial.printf("[WiFi] AP started: SSID=%s  IP=%s\n", WIFI_SSID, WiFi.softAPIP().toString().c_str());
+
+  webServer.on("/",          handleRoot);
+  webServer.on("/api/state", handleApiState);
+  webServer.on("/api/can",   handleApiCan);
+  webServer.begin();
+  Serial.println("[WiFi] Web server started on port 80");
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  SETUP
 // ═══════════════════════════════════════════════════════════════════
 void setup() {
@@ -616,6 +926,8 @@ void setup() {
   setupINA();
   setupIMU();
   setupNeoPixel();
+  setupAceButtons();
+  setupWiFiAP();
 
   Serial.println("[BOOT] Ready.\n");
 }
@@ -624,22 +936,31 @@ void setup() {
 //  INPUT STAGE
 // ═══════════════════════════════════════════════════════════════════
 
-// --- Read MCP buttons (active low: pressed = LOW → true) ---
+// --- Read MCP buttons via AceButton::checkState() ---
+// We read raw MCP state, invert (active-low), and feed AceButton.
+// AceButton default: HIGH = released, LOW = pressed.
 void readButtons() {
   if (mcp1_ok) {
-    btnUpdate(btnDefrost, !mcp1.digitalRead(MCP1_DEFROST_INPUT));
-    btnUpdate(btnTrunk,   !mcp1.digitalRead(MCP1_TRUNK_INPUT));
+    abDefrost.checkState(mcp1.digitalRead(MCP1_DEFROST_INPUT) ? HIGH : LOW);
+    abTrunk.checkState(  mcp1.digitalRead(MCP1_TRUNK_INPUT)   ? HIGH : LOW);
   }
   if (mcp2_ok) {
-    btnUpdate(btnBrakeRight, !mcp2.digitalRead(MCP2_BRAKE_RIGHT_INPUT));
-    btnUpdate(btnBrakeLeft,  !mcp2.digitalRead(MCP2_BRAKE_LEFT_INPUT));
-    btnUpdate(btnReverse,    !mcp2.digitalRead(MCP2_REVERSE_INPUT));
-    btnUpdate(btnForward,    !mcp2.digitalRead(MCP2_FORWARD_INPUT));
-    btnUpdate(btnBrouillard, !mcp2.digitalRead(MCP2_BROUILLARD_INPUT));
-    btnUpdate(btnCablight,   !mcp2.digitalRead(MCP2_CABLIGHT_INPUT));
-    btnUpdate(btnWarning,    !mcp2.digitalRead(MCP2_WARNING_INPUT));
-    btnUpdate(btnMap,        !mcp2.digitalRead(MCP2_MAP_INPUT));
-    btnUpdate(btnSeat,       !mcp2.digitalRead(MCP2_SEAT_INPUT));
+    uint8_t blState = mcp2.digitalRead(MCP2_BRAKE_LEFT_INPUT)  ? HIGH : LOW;
+    uint8_t brState = mcp2.digitalRead(MCP2_BRAKE_RIGHT_INPUT) ? HIGH : LOW;
+    uint8_t stState = mcp2.digitalRead(MCP2_SEAT_INPUT)        ? HIGH : LOW;
+    rawBrakeLeft  = (blState == LOW);   // active-low: LOW = pressed
+    rawBrakeRight = (brState == LOW);
+    rawSeat       = (stState == LOW);
+
+    abBrakeRight.checkState(brState);
+    abBrakeLeft.checkState( blState);
+    abReverse.checkState(   mcp2.digitalRead(MCP2_REVERSE_INPUT)     ? HIGH : LOW);
+    abForward.checkState(   mcp2.digitalRead(MCP2_FORWARD_INPUT)     ? HIGH : LOW);
+    abBrouillard.checkState(mcp2.digitalRead(MCP2_BROUILLARD_INPUT)  ? HIGH : LOW);
+    abCablight.checkState(  mcp2.digitalRead(MCP2_CABLIGHT_INPUT)    ? HIGH : LOW);
+    abWarning.checkState(   mcp2.digitalRead(MCP2_WARNING_INPUT)     ? HIGH : LOW);
+    abMap.checkState(       mcp2.digitalRead(MCP2_MAP_INPUT)         ? HIGH : LOW);
+    abSeat.checkState(      stState);
   }
 }
 
@@ -647,12 +968,14 @@ void readButtons() {
 void readCAN() {
   twai_message_t msg;
   while (twai_receive(&msg, 0) == ESP_OK) {
-    // Debug: print every CAN packet on serial
-    Serial.printf("[CAN RX] ID=0x%03X DLC=%d Data=", msg.identifier, msg.data_length_code);
-    for (int i = 0; i < msg.data_length_code; i++) {
-      Serial.printf("%02X ", msg.data[i]);
+    // Build log string for serial + web terminal
+    char buf[80];
+    int pos = snprintf(buf, sizeof(buf), "[CAN RX] ID=0x%03X DLC=%d Data=", msg.identifier, msg.data_length_code);
+    for (int i = 0; i < msg.data_length_code && pos < (int)sizeof(buf) - 4; i++) {
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "%02X ", msg.data[i]);
     }
-    Serial.println();
+    Serial.println(buf);
+    canLogPush(String(buf));
 
     // Parse known IDs (all little-endian per SiliXcon docs)
     switch (msg.identifier) {
@@ -717,40 +1040,40 @@ void generateEvents() {
   prevSpeedAbove5 = speedAbove5;
 
   // --- Mapping button ---
-  if (btnMap.shortRelease) ev.BTN_MAPPING_SHORT = true;
-  if (btnMap.longRelease)  ev.BTN_MAPPING_LONG  = true;
+  if (bevMap.shortPress) ev.BTN_MAPPING_SHORT = true;
+  if (bevMap.longPress)  ev.BTN_MAPPING_LONG  = true;
 
   // --- Cabin light button ---
-  if ((btnCablight.shortRelease || btnCablight.longRelease) && stationary)
+  if ((bevCablight.shortPress || bevCablight.longPress) && stationary)
     ev.BTN_CABLIGHT_AND_STATIONNARY = true;
-  if ((btnCablight.shortRelease || btnCablight.longRelease) && driving)
+  if ((bevCablight.shortPress || bevCablight.longPress) && driving)
     ev.BTN_CABLIGHT_AND_DRIVING = true;
-  if (btnCablight.released)
+  if (bevCablight.released)
     ev.BTN_CABLIGHT_RELEASED = true;
 
   // --- Trunk button → cabin light trunk trigger ---
-  if ((btnTrunk.shortRelease || btnTrunk.longRelease) && stationary)
+  if ((bevTrunk.shortPress || bevTrunk.longPress) && stationary)
     ev.BTN_TRUNK_AND_STATIONNARY = true;
 
   // --- Trunk FSM events ---
-  if (btnTrunk.released && stationary) ev.BTN_TRUNK_RELEASED_AND_STATIONNARY = true;
-  if (btnTrunk.released && driving)    ev.BTN_TRUNK_RELEASED_AND_DRIVING     = true;
+  if (bevTrunk.released && stationary) ev.BTN_TRUNK_RELEASED_AND_STATIONNARY = true;
+  if (bevTrunk.released && driving)    ev.BTN_TRUNK_RELEASED_AND_DRIVING     = true;
 
   // --- Fog ---
-  if (btnBrouillard.shortRelease) ev.BTN_BROUILLARD_SHORT = true;
-  if (btnBrouillard.longRelease)  ev.BTN_BROUILLARD_LONG  = true;
+  if (bevBrouillard.shortPress) ev.BTN_BROUILLARD_SHORT = true;
+  if (bevBrouillard.longPress)  ev.BTN_BROUILLARD_LONG  = true;
 
   // --- Seat sensor ---
-  if (btnSeat.pressed)  ev.SEATSENSOR_PRESSED  = true;
-  if (btnSeat.released) ev.SEATSENSOR_RELEASED = true;
+  if (bevSeat.pressed)  ev.SEATSENSOR_PRESSED  = true;
+  if (bevSeat.released) ev.SEATSENSOR_RELEASED = true;
 
   // --- Defroster ---
   bool battOk = (batterySocPct > 30);
-  if (btnDefrost.shortRelease) {
+  if (bevDefrost.shortPress) {
     ev.BTN_DEFROSTER_SHORT = true;
     if (battOk) ev.BTN_DEFROSTER_SHORT_AND_BATTERY_OK = true;
   }
-  if (btnDefrost.longRelease) {
+  if (bevDefrost.longPress) {
     ev.BTN_DEFROSTER_LONG = true;
     if (battOk) ev.BTN_DEFROSTER_LONG_AND_BATTERY_OK = true;
   }
@@ -759,17 +1082,17 @@ void generateEvents() {
   }
 
   // --- Warning ---
-  if (btnWarning.released) ev.BTN_WARNING_RELEASED = true;
+  if (bevWarning.released) ev.BTN_WARNING_RELEASED = true;
 
   // --- Forward / Reverse (drive direction) ---
-  if (btnForward.shortRelease) ev.BTN_FORWARD_SHORT = true;
-  if (btnForward.longRelease)  ev.BTN_FORWARD_LONG  = true;
-  if (btnReverse.shortRelease) ev.BTN_REVERSE_SHORT = true;
-  if (btnReverse.longRelease)  ev.BTN_REVERSE_LONG  = true;
+  if (bevForward.shortPress) ev.BTN_FORWARD_SHORT = true;
+  if (bevForward.longPress)  ev.BTN_FORWARD_LONG  = true;
+  if (bevReverse.shortPress) ev.BTN_REVERSE_SHORT = true;
+  if (bevReverse.longPress)  ev.BTN_REVERSE_LONG  = true;
 
-  // --- Brake composite ---
-  bool bl = btnBrakeLeft.raw;
-  bool br = btnBrakeRight.raw;
+  // --- Brake composite (uses raw level, not edge) ---
+  bool bl = rawBrakeLeft;
+  bool br = rawBrakeRight;
   if (!bl && !br) ev.BRAKE_NONE       = true;
   if ( bl && !br) ev.BRAKE_LEFT_ONLY  = true;
   if (!bl &&  br) ev.BRAKE_RIGHT_ONLY = true;
@@ -1223,12 +1546,12 @@ void sendCanControl() {
 
   // Build byte 6
   canDigIn = 0;
-  if (btnSeat.raw) canDigIn |= 0x01;                        // digital in 0 = seat
+  if (rawSeat) canDigIn |= 0x01;                            // digital in 0 = seat
   if (fsmMapping == ST_MAPPING_PRESSED) canDigIn |= 0x10;   // map switch pulse (bit 4)
 
   // Build byte 7
   canCmd = 0;
-  if (!btnSeat.raw) canCmd |= 0x01;  // disarm when seat released
+  if (!rawSeat) canCmd |= 0x01;  // disarm when seat released
 
   // Pack (little-endian)
   twai_message_t msg;
@@ -1367,17 +1690,17 @@ void printSensors() {
 //  CLEAR BUTTON ONE-SHOTS (after event consumption)
 // ═══════════════════════════════════════════════════════════════════
 void clearButtonOneShots() {
-  btnReset(btnMap);
-  btnReset(btnTrunk);
-  btnReset(btnDefrost);
-  btnReset(btnCablight);
-  btnReset(btnBrouillard);
-  btnReset(btnWarning);
-  btnReset(btnForward);
-  btnReset(btnReverse);
-  btnReset(btnSeat);
-  btnReset(btnBrakeLeft);
-  btnReset(btnBrakeRight);
+  bevReset(bevMap);
+  bevReset(bevTrunk);
+  bevReset(bevDefrost);
+  bevReset(bevCablight);
+  bevReset(bevBrouillard);
+  bevReset(bevWarning);
+  bevReset(bevForward);
+  bevReset(bevReverse);
+  bevReset(bevSeat);
+  bevReset(bevBrakeLeft);
+  bevReset(bevBrakeRight);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1415,7 +1738,10 @@ void loop() {
   // 6. DIAGNOSTICS — periodic sensor print
   printSensors();
 
-  // 7. Clear one-shot flags
+  // 7. WEB — handle HTTP clients
+  webServer.handleClient();
+
+  // 8. Clear one-shot flags
   clearButtonOneShots();
 
   // Minimal yield — I2C reads are the bottleneck (~1 ms per MCP transaction)
