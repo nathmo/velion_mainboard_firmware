@@ -36,11 +36,36 @@ using namespace ace_button;
 // ═══════════════════════════════════════════════════════════════════
 //  FORWARD DECLARATIONS (required for Arduino IDE prototype generation)
 // ═══════════════════════════════════════════════════════════════════
+struct BtnEvents;
 struct SoftTimer;
 struct Events;
+void bevReset(BtnEvents &b);
 void timerStart(SoftTimer &t, uint32_t ms);
 void timerStop(SoftTimer &t);
 bool timerExpired(SoftTimer &t);
+
+// FSM enum forward declarations (must be before auto-prototypes)
+enum MappingState    { ST_MAPPING_CLEAR, ST_MAPPING_PRESSED };
+enum CabinLightState { ST_CABINLIGHT_OFF, ST_CABINLIGHT_ON,
+                        ST_CABINLIGHT_ON_TRUNK, ST_CABINLIGHT_ON_DRV };
+enum TrunkState      { ST_TRUNK_LATCHED, ST_TRUNK_OPENING,
+                        ST_TRUNK_BLINK_ON, ST_TRUNK_BLINK_OFF };
+enum FogState        { ST_FSM_FOG_OFF, ST_FSM_FOG_ON, ST_FSM_FOG_ON_GRACE };
+enum DefrosterState  { ST_FSM_DEFROSTER_OFF, ST_FSM_DEFROSTER_ON,
+                        ST_FSM_DEFROSTER_FAULT_BLINK_OFF,
+                        ST_FSM_DEFROSTER_FAULT_BLINK_ON };
+enum BlinkerState    { ST_BLINKER_IDLE,
+                        ST_WARNING_ON, ST_WARNING_OFF,
+                        ST_BLINKER_LEFT_ON,  ST_BLINKER_LEFT_OFF,
+                        ST_BLINKER_RIGHT_ON, ST_BLINKER_RIGHT_OFF };
+enum DriveState      { ST_DRIVE_NEUTRAL,
+                        ST_DRIVE_FORWARD, ST_DRIVE_FORWARD_LOCK, ST_DRIVE_FWD_PENDING,
+                        ST_DRIVE_REVERSE, ST_DRIVE_REVERSE_LOCK, ST_DRIVE_REV_PENDING };
+enum BrakeState      { ST_BRAKE_LEVEL_0, ST_BRAKE_LEVEL_25,
+                        ST_BRAKE_LEVEL_50, ST_BRAKE_LEVEL_100 };
+enum PowerState      { ST_POWER_OFF, ST_POWER_ON, ST_POWER_ON_GRACE };
+enum DrlState        { ST_DRL_OFF, ST_DRL_ON, ST_DRL_ON_GRACE };
+enum LowbeamState    { ST_LOWBEAM_OFF, ST_LOWBEAM_ON, ST_LOWBEAM_ON_GRACE };
 
 // ═══════════════════════════════════════════════════════════════════
 //  WIFI HOTSPOT & WEB SERVER CONFIGURATION
@@ -437,62 +462,20 @@ SoftTimer tmrDrlIdle          = {false, 0, 3600000UL};
 SoftTimer tmrLowbeamIdle      = {false, 0, 300000UL};     // 5 min
 
 // ═══════════════════════════════════════════════════════════════════
-//  FSM STATES
+//  FSM STATE VARIABLES (enums declared in forward declarations above)
 // ═══════════════════════════════════════════════════════════════════
 
-// — Mapping button —
-enum MappingState { ST_MAPPING_CLEAR, ST_MAPPING_PRESSED };
-MappingState fsmMapping = ST_MAPPING_CLEAR;
-
-// — Cabin light —
-enum CabinLightState { ST_CABINLIGHT_OFF, ST_CABINLIGHT_ON,
-                        ST_CABINLIGHT_ON_TRUNK, ST_CABINLIGHT_ON_DRV };
+MappingState    fsmMapping    = ST_MAPPING_CLEAR;
 CabinLightState fsmCabinLight = ST_CABINLIGHT_OFF;
-
-// — Trunk —
-enum TrunkState { ST_TRUNK_LATCHED, ST_TRUNK_OPENING,
-                   ST_TRUNK_BLINK_ON, ST_TRUNK_BLINK_OFF };
-TrunkState fsmTrunk = ST_TRUNK_LATCHED;
-
-// — Fog —
-enum FogState { ST_FSM_FOG_OFF, ST_FSM_FOG_ON, ST_FSM_FOG_ON_GRACE };
-FogState fsmFog = ST_FSM_FOG_OFF;
-
-// — Defroster —
-enum DefrosterState { ST_FSM_DEFROSTER_OFF, ST_FSM_DEFROSTER_ON,
-                       ST_FSM_DEFROSTER_FAULT_BLINK_OFF,
-                       ST_FSM_DEFROSTER_FAULT_BLINK_ON };
-DefrosterState fsmDefroster = ST_FSM_DEFROSTER_OFF;
-
-// — Blinker / Warning —
-enum BlinkerState { ST_BLINKER_IDLE,
-                     ST_WARNING_ON, ST_WARNING_OFF,
-                     ST_BLINKER_LEFT_ON,  ST_BLINKER_LEFT_OFF,
-                     ST_BLINKER_RIGHT_ON, ST_BLINKER_RIGHT_OFF };
-BlinkerState fsmBlinker = ST_BLINKER_IDLE;
-
-// — Drive direction —
-enum DriveState { ST_DRIVE_NEUTRAL,
-                   ST_DRIVE_FORWARD, ST_DRIVE_FORWARD_LOCK, ST_DRIVE_FWD_PENDING,
-                   ST_DRIVE_REVERSE, ST_DRIVE_REVERSE_LOCK, ST_DRIVE_REV_PENDING };
-DriveState fsmDrive = ST_DRIVE_NEUTRAL;
-
-// — Brake —
-enum BrakeState { ST_BRAKE_LEVEL_0, ST_BRAKE_LEVEL_25,
-                   ST_BRAKE_LEVEL_50, ST_BRAKE_LEVEL_100 };
-BrakeState fsmBrake = ST_BRAKE_LEVEL_0;
-
-// — Power —
-enum PowerState { ST_POWER_OFF, ST_POWER_ON, ST_POWER_ON_GRACE };
-PowerState fsmPower = ST_POWER_OFF;
-
-// — DRL —
-enum DrlState { ST_DRL_OFF, ST_DRL_ON, ST_DRL_ON_GRACE };
-DrlState fsmDrl = ST_DRL_OFF;
-
-// — Low beam —
-enum LowbeamState { ST_LOWBEAM_OFF, ST_LOWBEAM_ON, ST_LOWBEAM_ON_GRACE };
-LowbeamState fsmLowbeam = ST_LOWBEAM_OFF;
+TrunkState      fsmTrunk      = ST_TRUNK_LATCHED;
+FogState        fsmFog        = ST_FSM_FOG_OFF;
+DefrosterState  fsmDefroster  = ST_FSM_DEFROSTER_OFF;
+BlinkerState    fsmBlinker    = ST_BLINKER_IDLE;
+DriveState      fsmDrive      = ST_DRIVE_NEUTRAL;
+BrakeState      fsmBrake      = ST_BRAKE_LEVEL_0;
+PowerState      fsmPower      = ST_POWER_OFF;
+DrlState        fsmDrl        = ST_DRL_OFF;
+LowbeamState    fsmLowbeam    = ST_LOWBEAM_OFF;
 
 // ═══════════════════════════════════════════════════════════════════
 //  LOCAL STATE (from sensors / CAN)
