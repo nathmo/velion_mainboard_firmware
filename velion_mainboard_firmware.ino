@@ -899,6 +899,8 @@ void setup() {
   delay(500);
   Serial.println("\n========================================");
   Serial.println(" Velion Mainboard Firmware — Booting");
+  Serial.println(" Please connect via the wifi hotspot Velion-Dashboard for debugging");
+  Serial.println(" passwrod : velion1234");
   Serial.println("========================================");
 
   Wire.begin(SDA_PIN, SCL_PIN);
