@@ -515,7 +515,7 @@ uint32_t lastCanBroadcast = 0;
 
 void setupCAN() {
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-  twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_250KBITS();
+  twai_timing_config_t  t_config = TWAI_TIMING_CONFIG_1MBITS();
   twai_filter_config_t  f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
   if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {

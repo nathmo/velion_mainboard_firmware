@@ -110,6 +110,11 @@ TIMER, for each FSM as needed. they can be implemented in software / hardware an
 | BMS Telemetry     | `0x610–0x619` |
 | BMS Heartbeat RX  | `0x601`       |
 
+we need to listen for packet with ID 0x407	which is the	throttle 8 bit ADC value. we store that value
+
+
+
+we need to send CAN message for the Silixcon controller
 
 # input conditionning
 read the value from HAL and update the local state or event (ace rotatry and button generate directly the cleaned event too)
@@ -1126,4 +1131,80 @@ STATE TEMPERATURE_MEDIUM
 STATE TEMPERATURE_WARM
 STATE TEMPERATURE_HOT
 STATE TEMPERATURE_INFERNO
+
+## CAN Communication
+
+This firmware supports CAN communication for broadcasting and receiving control inputs. Below are the details of the CAN messages implemented:
+
+### Brake Status
+- **Digital Brake Status**: Broadcasts the on/off status for left, right, and any brake (3 bits).
+- **Analog Brake Level**: Broadcasts the computed braking level as a percentage (0%, 25%, 50%, 100%).
+
+### Throttle
+- **Throttle Input**: Broadcasts the throttle value received from the input device.
+
+### Reverse Bit
+- **Reverse Configuration**: Broadcasts the reverse bit to configure the siliXcon controller to use this as an input.
+
+These messages are designed to integrate seamlessly with the siliXcon LYNX firmware, ensuring compatibility and efficient communication.
+
+### CAN ID and Bit Mapping
+
+#### CAN IDs
+- **Brake Status**: 0x100
+- **Throttle**: 0x101
+- **Reverse Bit**: 0x102
+- **Control Message**: 0x5FF
+
+#### Bit Mapping
+- **Brake Status (0x100)**:
+  - Bit 0: Left brake (on/off)
+  - Bit 1: Right brake (on/off)
+  - Bit 2: Any brake (on/off)
+  - Bits 3-7: Reserved
+  - Byte 1: Analog brake level (0-100%)
+
+- **Throttle (0x101)**:
+  - Byte 0: Throttle value (0-255)
+  - Bytes 1-7: Reserved
+
+- **Reverse Bit (0x102)**:
+  - Bit 0: Reverse status (on/off)
+  - Bits 1-7: Reserved
+  - Bytes 1-7: Reserved
+
+While we broadcast the status on the can with the previous ID, we also repack theses value in the following package for the silixcon controller to use.
+We thus pack : The throttle (analog), the brake level (analog, 0,25,50,100 %), and as digital inputs :  the reverse, the brake right + brake left, the seat sensor, the mapping button press
+
+
+- **Control Message (0x5FF)**:
+  - **Message Requirements**:
+    - Timeout: 200ms
+    - Continuous presence required
+    - Timeout triggers MODE 20 (CAN timeout)
+  
+  - **Invalid Data Handling**:
+    - For INT_16 values:
+      - 32767 indicates invalid reading
+      - On invalid input, either use this value or stop message transmission
+
+  - **Message Structure**:
+    - Byte 0-1: INT_16, CAN Level 1 (1,255)
+    - Byte 2-3: INT_16, CAN Level 2 (2,255)
+    - Byte 4-5: INT_16, CAN Level 3 (3,255)
+    - Byte 6: UINT_8, Digital Inputs:
+      - Bit 0: Digital in 0
+      - Bit 1: Digital in 1
+      - Bit 2: Digital in 2
+      - Bit 3: Digital in 3
+      - Digital inputs: 10,255; 11,255; 12,255; 13,255
+      - Map switching: 20,255; 21,255; 22,255; 23,255
+    - Byte 7: UINT_8, Commands:
+      - Bit 0: Disarm - Activates seatswitch mode
+
+  - **Map Switching Behavior**:
+    - 2x values: Auto-generates pulse on each message
+    - 1x values: Requires pulse completion
+
+This mapping ensures compatibility with the siliXcon LYNX firmware and adheres to the fixed DLC of 8 bytes for all messages.
 
