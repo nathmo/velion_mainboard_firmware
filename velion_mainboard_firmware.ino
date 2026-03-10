@@ -186,11 +186,12 @@ bool mpu_ok = false, bmp_ok = false;
 // ═══════════════════════════════════════════════════════════════════
 //  CAN IDs (SiliXcon LYNX protocol)
 // ═══════════════════════════════════════════════════════════════════
-#define CAN_ID_CONTROL       0x5FF   // TX: control input message
-#define CAN_ID_VDS_BTN_EVT   0x5FE   // RX: VDS display button event
-#define CAN_ID_LYNX_STATUS   0x600   // RX: LYNX status
-#define CAN_ID_MOTOR_STATUS  0x610   // RX: motor / vehicle speed
-#define CAN_ID_BATTERY_STATUS 0x618  // RX: battery SOC/voltage/current
+#define CAN_ID_CONTROL        0x5FF   // TX: control input message
+#define CAN_ID_VDS_BTN_EVT    0x5FE   // RX: VDS display button event
+#define CAN_ID_LYNX_STATUS    0x600   // RX: LYNX status
+#define CAN_ID_MOTOR_STATUS   0x610   // RX: motor / vehicle speed
+#define CAN_ID_BATTERY_STATUS 0x618   // RX: battery SOC/voltage/current
+#define CAN_ID_THROTTLE_RX    0x407   // RX: throttle 8-bit ADC from control board
 
 // Mainboard broadcast range 0x420-0x480
 #define CAN_ID_MB_LIGHTS     0x420   // TX: lighting state
@@ -487,6 +488,9 @@ int16_t  batteryCurrent02A = 0;    // 0.02 A units
 uint8_t  lynxMode          = 0;
 uint8_t  currentMap        = 0;
 bool     prevSpeedAbove5   = false;
+uint8_t  canThrottleRx     = 0;       // from CAN 0x407 byte 0 (8-bit ADC)
+uint32_t lastThrottleRxMs  = 0;       // timestamp of last 0x407 reception
+#define  THROTTLE_RX_TIMEOUT_MS 500   // consider throttle stale after 500 ms
 
 // ═══════════════════════════════════════════════════════════════════
 //  CAN TX: 0x5FF control message — built every cycle
@@ -985,6 +989,14 @@ void readCAN() {
         if (msg.data_length_code >= 3) {
           lynxMode   = msg.data[1];
           currentMap = msg.data[2];
+        }
+        break;
+      }
+      case CAN_ID_THROTTLE_RX: {
+        // 0x407: byte 0 = throttle 8-bit ADC value from control board
+        if (msg.data_length_code >= 1) {
+          canThrottleRx    = msg.data[0];
+          lastThrottleRxMs = millis();
         }
         break;
       }
@@ -1529,14 +1541,40 @@ void sendCanControl() {
   if (now - lastCanTx < CAN_TX_INTERVAL) return;
   lastCanTx = now;
 
-  // Build byte 6
-  canDigIn = 0;
-  if (rawSeat) canDigIn |= 0x01;                            // digital in 0 = seat
-  if (fsmMapping == ST_MAPPING_PRESSED) canDigIn |= 0x10;   // map switch pulse (bit 4)
+  // ── CAN Level 1 (bytes 0-1): Throttle ──
+  // Forward the 8-bit ADC throttle from 0x407 scaled to INT16 (0-32766).
+  // If throttle RX timed out, report invalid (32767).
+  if (now - lastThrottleRxMs < THROTTLE_RX_TIMEOUT_MS) {
+    canLevel1 = (int16_t)((uint32_t)canThrottleRx * 32766 / 255);
+  } else {
+    canLevel1 = 0x7FFF;  // invalid — no recent throttle data
+  }
 
-  // Build byte 7
+  // ── CAN Level 2 (bytes 2-3): Brake analog level ──
+  // Map brake FSM state to analoglevel (0/25/50/100 → 0..32766).
+  switch (fsmBrake) {
+    case ST_BRAKE_LEVEL_0:   canLevel2 = 0;     break;
+    case ST_BRAKE_LEVEL_25:  canLevel2 = 8191;  break;  // ~25%
+    case ST_BRAKE_LEVEL_50:  canLevel2 = 16383; break;  // ~50%
+    case ST_BRAKE_LEVEL_100: canLevel2 = 32766; break;  // 100%
+  }
+
+  // ── CAN Level 3 (bytes 4-5): unused, keep invalid ──
+  canLevel3 = 0x7FFF;
+
+  // ── Byte 6: Digital inputs + map switching ──
+  canDigIn = 0;
+  if (rawSeat)       canDigIn |= 0x01;   // bit 0 = digital in 0 (seat sensor)
+  if (rawBrakeLeft)  canDigIn |= 0x02;   // bit 1 = digital in 1 (brake left)
+  if (rawBrakeRight) canDigIn |= 0x04;   // bit 2 = digital in 2 (brake right)
+  // bit 3 = digital in 3 (reverse): high when drive FSM is in any reverse state
+  if (fsmDrive == ST_DRIVE_REVERSE || fsmDrive == ST_DRIVE_REVERSE_LOCK || fsmDrive == ST_DRIVE_REV_PENDING)
+    canDigIn |= 0x08;
+  if (fsmMapping == ST_MAPPING_PRESSED) canDigIn |= 0x10;   // bit 4 = map switch pulse
+
+  // ── Byte 7: Commands ──
   canCmd = 0;
-  if (!rawSeat) canCmd |= 0x01;  // disarm when seat released
+  if (!rawSeat) canCmd |= 0x01;  // bit 0 = disarm when seat released
 
   // Pack (little-endian)
   twai_message_t msg;

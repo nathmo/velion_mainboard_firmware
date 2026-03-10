@@ -109,12 +109,59 @@ TIMER, for each FSM as needed. they can be implemented in software / hardware an
 | VDS Button Event  | `0x5FE`       |
 | BMS Telemetry     | `0x610–0x619` |
 | BMS Heartbeat RX  | `0x601`       |
+| Throttle Input    | `0x407`       |
 
-we need to listen for packet with ID 0x407	which is the	throttle 8 bit ADC value. we store that value
+## RX: Throttle Input (`0x407`)
 
+Received from the control board. Contains the throttle 8-bit ADC value.
 
+| Byte | Type   | Description          |
+| ---- | ------ | -------------------- |
+| 0    | UINT_8 | Throttle ADC (0–255) |
 
-we need to send CAN message for the Silixcon controller
+- Stored in `canThrottleRx`.
+- If no 0x407 message is received within 500 ms, the throttle is considered stale and reported as invalid (32767) to the siliXcon.
+
+## TX: siliXcon Control Input (`0x5FF`)
+
+Sent every 50 ms (20 Hz). Follows the [siliXcon LYNX CAN Control Input](https://docs.silixcon.com/docs/fw/apps/esc/lynx/can/control_input) protocol. All values little-endian, DLC = 8 bytes. If not received within 200 ms the controller enters MODE 20 (CAN timeout).
+
+| Byte | Type    | Description                  | siliXcon Input Param | Source                                               |
+| ---- | ------- | ---------------------------- | -------------------- | ---------------------------------------------------- |
+| 0-1  | INT_16  | CAN Level 1 — **Throttle**   | 1,255                | 0x407 ADC scaled 0→32766 (32767 = invalid/stale)     |
+| 2-3  | INT_16  | CAN Level 2 — **Brake level**| 2,255                | Brake FSM: 0%→0, 25%→8191, 50%→16383, 100%→32766    |
+| 4-5  | INT_16  | CAN Level 3 — *unused*       | 3,255                | 32767 (invalid)                                      |
+| 6    | UINT_8  | Digital Inputs + Map switch  | see below            | See bit mapping                                      |
+| 7    | UINT_8  | Commands                     | —                    | Bit 0 = disarm/seatswitch                            |
+
+### Byte 6 — Digital inputs & map switching
+
+| Bit | Signal            | siliXcon Input Param | Description                                |
+| --- | ----------------- | -------------------- | ------------------------------------------ |
+| 0   | Seat sensor       | 10,255               | 1 = seat occupied                          |
+| 1   | Brake left        | 11,255               | 1 = left brake pressed                     |
+| 2   | Brake right       | 12,255               | 1 = right brake pressed                    |
+| 3   | Reverse           | 13,255               | 1 = drive FSM in reverse state             |
+| 4   | Map switch (2x)   | 20,255               | Auto-pulse when mapping button is pressed  |
+| 5-7 | Reserved          | —                    | 0                                          |
+
+### Byte 7 — Commands
+
+| Bit | Signal  | Description                              |
+| --- | ------- | ---------------------------------------- |
+| 0   | Disarm  | 1 = seat released → activates seatswitch |
+| 1-7 | Reserved| 0                                        |
+
+### Data flow summary
+
+```
+[Control board] --0x407 (throttle ADC)--> [Mainboard] --0x5FF--> [siliXcon]
+                                             |
+                  Brake left/right buttons --+-- CAN Level 1 = throttle
+                  Reverse FSM state       --+-- CAN Level 2 = brake analog
+                  Seat sensor             --+-- Byte 6 bits = digital in
+                  Map button              --+-- Byte 7 bit 0 = disarm
+```
 
 # input conditionning
 read the value from HAL and update the local state or event (ace rotatry and button generate directly the cleaned event too)
