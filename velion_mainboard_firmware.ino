@@ -946,9 +946,20 @@ void handleApiCan() {
 
 void setupWiFiAP() {
   WiFi.mode(WIFI_AP);
+
+  IPAddress apIp(192, 168, 4, 1);
+  IPAddress apGw(192, 168, 4, 1);
+  IPAddress apMask(255, 255, 255, 0);
+  IPAddress dhcpStart(192, 168, 4, 11);
+
+  if (!WiFi.softAPConfig(apIp, apGw, apMask, dhcpStart)) {
+    Serial.println("[WiFi] softAPConfig FAILED (DHCP lease start)");
+  }
+
   WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
   delay(100);
   Serial.printf("[WiFi] AP started: SSID=%s  IP=%s\n", WIFI_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("[WiFi] DHCP lease range starts at %s (static reserved: 192.168.4.1-10)\n", dhcpStart.toString().c_str());
 
   webServer.on("/",          handleRoot);
   webServer.on("/api/state", handleApiState);
