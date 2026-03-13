@@ -193,6 +193,11 @@ bool mpu_ok = false, bmp_ok = false;
 #define CAN_ID_MOTOR_STATUS   0x610   // RX: motor / vehicle speed
 #define CAN_ID_BATTERY_STATUS 0x618   // RX: battery SOC/voltage/current
 #define CAN_ID_THROTTLE_RX    0x407   // RX: throttle 8-bit ADC from control board
+#define CAN_ID_LIGHT_CONTROL  0x400   // RX: Filovelox smart button light-control word
+
+// CAN light-control bits (match lightboard protocol)
+#define BIT_RIGHT_BLINK       3
+#define BIT_LEFT_BLINK        4
 
 // Mainboard broadcast range 0x420-0x480
 #define CAN_ID_MB_LIGHTS     0x420   // TX: lighting state
@@ -494,6 +499,11 @@ bool     prevSpeedAbove5   = false;
 uint8_t  canThrottleRx     = 0;       // from CAN 0x407 byte 0 (8-bit ADC)
 uint32_t lastThrottleRxMs  = 0;       // timestamp of last 0x407 reception
 #define  THROTTLE_RX_TIMEOUT_MS 500   // consider throttle stale after 500 ms
+
+uint16_t canLightCtrlBits      = 0;
+uint16_t canLightCtrlBitsPrev  = 0;
+bool     canBlinkLeftToggleReq = false;
+bool     canBlinkRightToggleReq = false;
 
 // ═══════════════════════════════════════════════════════════════════
 //  CAN TX: 0x5FF control message — built every cycle
@@ -1053,6 +1063,23 @@ void readCAN() {
         }
         break;
       }
+      case CAN_ID_LIGHT_CONTROL: {
+        // 0x400: bytes 0-1 = UINT16 light-control bits (LE)
+        if (msg.data_length_code >= 2) {
+          canLightCtrlBitsPrev = canLightCtrlBits;
+          canLightCtrlBits = (uint16_t)(msg.data[0] | (msg.data[1] << 8));
+
+          bool leftNow   = (canLightCtrlBits & (1U << BIT_LEFT_BLINK)) != 0;
+          bool leftPrev  = (canLightCtrlBitsPrev & (1U << BIT_LEFT_BLINK)) != 0;
+          bool rightNow  = (canLightCtrlBits & (1U << BIT_RIGHT_BLINK)) != 0;
+          bool rightPrev = (canLightCtrlBitsPrev & (1U << BIT_RIGHT_BLINK)) != 0;
+
+          // Rising edge = one toggle request for each side.
+          if (leftNow && !leftPrev)   canBlinkLeftToggleReq = true;
+          if (rightNow && !rightPrev) canBlinkRightToggleReq = true;
+        }
+        break;
+      }
       case CAN_ID_VDS_BTN_EVT: {
         // 0x5FE: bytes 0-3 = UINT32 VDS /common/buttons value
         if (msg.data_length_code >= 4) {
@@ -1138,6 +1165,16 @@ void generateEvents() {
 
   // --- Warning ---
   if (bevWarning.released) ev.BTN_WARNING_RELEASED = true;
+
+  // --- Blinker commands from Filovelox smart button over CAN ---
+  if (canBlinkLeftToggleReq) {
+    ev.BTN_BLINKER_LEFT_RELEASED = true;
+    canBlinkLeftToggleReq = false;
+  }
+  if (canBlinkRightToggleReq) {
+    ev.BTN_BLINKER_RIGHT_RELEASED = true;
+    canBlinkRightToggleReq = false;
+  }
 
   // --- Forward / Reverse (drive direction) ---
   if (bevForward.shortPress) ev.BTN_FORWARD_SHORT = true;
