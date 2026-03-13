@@ -39,6 +39,7 @@ using namespace ace_button;
 struct BtnEvents;
 struct SoftTimer;
 struct Events;
+struct SonarChannel;
 void bevReset(BtnEvents &b);
 void timerStart(SoftTimer &t, uint32_t ms);
 void timerStop(SoftTimer &t);
@@ -110,9 +111,9 @@ void canLogPush(const String &line) {
 #define SDA_PIN                       23
 #define SCL_PIN                       22
 
-// CAN (TWAI) pins — adjust to your PCB
-#define CAN_TX_PIN  GPIO_NUM_27
-#define CAN_RX_PIN  GPIO_NUM_14
+// CAN (TWAI) pins
+#define CAN_TX_PIN  GPIO_NUM_18
+#define CAN_RX_PIN  GPIO_NUM_19
 
 // ═══════════════════════════════════════════════════════════════════
 //  MCP23017 PIN ALIASES (logical pin numbers inside Adafruit lib)
@@ -478,6 +479,8 @@ PowerState      fsmPower      = ST_POWER_OFF;
 DrlState        fsmDrl        = ST_DRL_OFF;
 LowbeamState    fsmLowbeam    = ST_LOWBEAM_OFF;
 
+bool mapCanPulsePending = false;
+
 // ═══════════════════════════════════════════════════════════════════
 //  LOCAL STATE (from sensors / CAN)
 // ═══════════════════════════════════════════════════════════════════
@@ -512,6 +515,9 @@ uint32_t lastCanTx        = 0;
 
 uint32_t lastCanBroadcast = 0;
 #define  CAN_BROADCAST_MS 100
+
+// Web output controls
+bool webDefrosterTogglePending = false;
 
 // ═══════════════════════════════════════════════════════════════════
 //  SETUP HELPERS
@@ -560,6 +566,8 @@ void setupMCP() {
 
     // *** POWER MOSFET always ON ***
     mcp1.digitalWrite(MCP1_POWER_GATE, HIGH);
+    // *** AUX AUDIO MOSFET always ON (temporary behavior) ***
+    mcp1.digitalWrite(MCP1_AUXAUDIO_GATE, HIGH);
   } else {
     Serial.println("[MCP1] 0x21 NOT FOUND");
   }
@@ -673,7 +681,7 @@ void setupNeoPixel() {
 }
 
 void setupGPIO() {
-  // MOSFET outputs — all OFF initially
+  // MOSFET outputs — default startup levels
   pinMode(DEFROSTER_MOSFET_GATE,       OUTPUT); digitalWrite(DEFROSTER_MOSFET_GATE,       LOW);
   pinMode(INTERRIOR_LIGHT_MOSFET_GATE, OUTPUT); digitalWrite(INTERRIOR_LIGHT_MOSFET_GATE, LOW);
   pinMode(BLIKER_LEFT_MOSFET_GATE,     OUTPUT); digitalWrite(BLIKER_LEFT_MOSFET_GATE,     LOW);
@@ -762,6 +770,12 @@ void handleRoot() {
   td:first-child{color:#8b949e;width:45%}
   .on{color:#3fb950;font-weight:bold}
   .off{color:#8b949e}
+    .actions{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}
+    .btn{border:1px solid #30363d;background:#21262d;color:#c9d1d9;padding:6px 10px;
+     border-radius:6px;cursor:pointer;font-size:0.85em}
+    .btn-on{border-color:#238636;color:#3fb950}
+    .btn-off{border-color:#da3633;color:#f85149}
+    .hint{font-size:0.78em;color:#8b949e;margin-top:8px}
   #term{background:#010409;border:1px solid #30363d;border-radius:8px;
         padding:8px;font-family:'Cascadia Code',monospace;font-size:0.82em;
         height:340px;overflow-y:auto;white-space:pre;color:#7ee787;margin-top:10px}
@@ -797,6 +811,14 @@ function buildCards(d){
   h+=row('Brake Right',d.brakeR?'PRESSED':'Released');
   h+=row('Throttle ADC',d.throttle);
   h+='</table></div>';
+  // Output control card
+  h+='<div class="card"><h2>⚙️ Outputs</h2><table>';
+  h+=row('AUX Audio MOSFET',d.auxAudio?'ON':'OFF');
+  h+=row('Defroster MOSFET',d.defMosfet?'ON':'OFF');
+  h+='</table>';
+  h+='<div class="actions">';
+  h+='<button class="btn btn-on" onclick="toggleDefroster()">Toggle Defroster (FSM)</button>';
+  h+='</div><div class="hint">AUX Audio MOSFET is forced ON in firmware.</div></div>';
   // Peripherals card
   h+='<div class="card"><h2>🔌 Peripherals</h2><table>';
   h+=row('MCP1 (0x21)',d.mcp1?'OK':'FAIL');
@@ -816,6 +838,12 @@ function updateTerm(lines){
   t.textContent=lines.join('\n');
   t.scrollTop=t.scrollHeight;
 }
+async function toggleDefroster(){
+  try{
+    await fetch('/api/output?name=defroster&action=toggle');
+    poll();
+  }catch(e){}
+}
 async function poll(){
   try{
     let r=await fetch('/api/state');let d=await r.json();buildCards(d);
@@ -831,7 +859,9 @@ poll();
 
 // ── JSON API: state ──────────────────────────────────────────────
 void handleApiState() {
-  char json[800];
+  bool defMosfet = (fsmDefroster == ST_FSM_DEFROSTER_ON);
+
+  char json[1024];
   snprintf(json, sizeof(json),
     "{\"power\":\"%s\",\"drive\":\"%s\",\"brake\":\"%s\","
     "\"drl\":\"%s\",\"lowbeam\":\"%s\",\"blinker\":\"%s\","
@@ -841,6 +871,7 @@ void handleApiState() {
     "\"lynxMode\":%d,\"currentMap\":%d,"
     "\"seat\":%s,\"brakeL\":%s,\"brakeR\":%s,"
     "\"throttle\":%d,"
+    "\"auxAudio\":%s,\"defMosfet\":%s,"
     "\"mcp1\":%s,\"mcp2\":%s,"
     "\"inaMain\":%s,\"inaHand\":%s,\"inaSeat\":%s,\"inaDef\":%s,"
     "\"mpu\":%s,\"bmp\":%s,"
@@ -856,6 +887,8 @@ void handleApiState() {
     rawBrakeLeft ? "true" : "false",
     rawBrakeRight ? "true" : "false",
     analogRead(THROTTLE_INPUT),
+    "true",
+    defMosfet ? "true" : "false",
     mcp1_ok ? "true" : "false", mcp2_ok ? "true" : "false",
     inaMain_ok ? "true" : "false", inaHand_ok ? "true" : "false",
     inaSeat_ok ? "true" : "false", inaDef_ok ? "true" : "false",
@@ -863,6 +896,25 @@ void handleApiState() {
     (unsigned long)(millis() / 1000)
   );
   webServer.send(200, "application/json", json);
+}
+
+// ── JSON API: output control ─────────────────────────────────────
+void handleApiOutput() {
+  if (!webServer.hasArg("name") || !webServer.hasArg("action")) {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"missing name/action\"}");
+    return;
+  }
+
+  String name = webServer.arg("name");
+  String action = webServer.arg("action");
+
+  if (name == "defroster" && action == "toggle") {
+    webDefrosterTogglePending = true;
+    webServer.send(200, "application/json", "{\"ok\":true,\"name\":\"defroster\",\"action\":\"toggle\"}");
+    return;
+  }
+
+  webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"unknown output\"}");
 }
 
 // ── JSON API: CAN log ────────────────────────────────────────────
@@ -891,6 +943,7 @@ void setupWiFiAP() {
   webServer.on("/",          handleRoot);
   webServer.on("/api/state", handleApiState);
   webServer.on("/api/can",   handleApiCan);
+  webServer.on("/api/output", handleApiOutput);
   webServer.begin();
   Serial.println("[WiFi] Web server started on port 80");
 }
@@ -1066,6 +1119,11 @@ void generateEvents() {
 
   // --- Defroster ---
   bool battOk = (batterySocPct > 30);
+  if (webDefrosterTogglePending) {
+    ev.BTN_DEFROSTER_SHORT = true;
+    if (battOk) ev.BTN_DEFROSTER_SHORT_AND_BATTERY_OK = true;
+    webDefrosterTogglePending = false;
+  }
   if (bevDefrost.shortPress) {
     ev.BTN_DEFROSTER_SHORT = true;
     if (battOk) ev.BTN_DEFROSTER_SHORT_AND_BATTERY_OK = true;
@@ -1115,13 +1173,15 @@ void generateEvents() {
 //  FSM: MAPPING BUTTON
 //  ST_MAPPING_CLEAR → ST_MAPPING_PRESSED on short/long press
 //  ST_MAPPING_PRESSED → ST_MAPPING_CLEAR on 2 s timeout
-//  While PRESSED, byte 6 bit 4 of 0x5FF is set → SiliXcon map switch
+//  Entering PRESSED queues a single CAN pulse; the FSM state still
+//  remains active for LED/diagnostic visibility during the 2 s window.
 // ═══════════════════════════════════════════════════════════════════
 void fsmStepMapping() {
   switch (fsmMapping) {
     case ST_MAPPING_CLEAR:
       if (ev.BTN_MAPPING_SHORT || ev.BTN_MAPPING_LONG) {
         fsmMapping = ST_MAPPING_PRESSED;
+        mapCanPulsePending = true;
         timerStart(tmrMapping, 2000);
       }
       break;
@@ -1467,7 +1527,10 @@ void fsmStepLowbeam() {
 // ═══════════════════════════════════════════════════════════════════
 void applyOutputs() {
   // ---- POWER MOSFET (MCP1 GPA3): always ON ----
-  if (mcp1_ok) mcp1.digitalWrite(MCP1_POWER_GATE, HIGH);
+  if (mcp1_ok) {
+    mcp1.digitalWrite(MCP1_POWER_GATE, HIGH);
+    mcp1.digitalWrite(MCP1_AUXAUDIO_GATE, HIGH);  // forced ON for now
+  }
 
   // ---- CABIN LIGHT (ESP GPIO 15 + MCP1 GPB1 CABLIGHT_LED) ----
   bool cabOn = (fsmCabinLight != ST_CABINLIGHT_OFF);
@@ -1491,8 +1554,7 @@ void applyOutputs() {
   // ---- DEFROSTER ----
   {
     bool defMosfet = (fsmDefroster == ST_FSM_DEFROSTER_ON);
-    bool defLed    = (fsmDefroster == ST_FSM_DEFROSTER_ON ||
-                      fsmDefroster == ST_FSM_DEFROSTER_FAULT_BLINK_ON);
+    bool defLed    = defMosfet || (fsmDefroster == ST_FSM_DEFROSTER_FAULT_BLINK_ON);
     digitalWrite(DEFROSTER_MOSFET_GATE, defMosfet ? HIGH : LOW);
     if (mcp1_ok) mcp1.digitalWrite(MCP1_DEFROST_LED, defLed ? HIGH : LOW);
   }
@@ -1533,8 +1595,8 @@ void applyOutputs() {
 //            bits 4-7: map switch     (IDs 20-23,255)
 //  Byte 7:   UINT8 commands  bit 0 = disarm/seatswitch
 //
-//  Map switching: we use "2x" auto-pulse — set bit 4 while
-//  fsmMapping == ST_MAPPING_PRESSED, controller triggers map change.
+//  Map switching: emit a single high pulse in one 0x5FF packet when the
+//  mapping button is pressed, then return the bit low on subsequent packets.
 // ═══════════════════════════════════════════════════════════════════
 void sendCanControl() {
   uint32_t now = millis();
@@ -1565,12 +1627,11 @@ void sendCanControl() {
   // ── Byte 6: Digital inputs + map switching ──
   canDigIn = 0;
   if (rawSeat)       canDigIn |= 0x01;   // bit 0 = digital in 0 (seat sensor)
-  if (rawBrakeLeft)  canDigIn |= 0x02;   // bit 1 = digital in 1 (brake left)
-  if (rawBrakeRight) canDigIn |= 0x04;   // bit 2 = digital in 2 (brake right)
+  if (rawBrakeLeft | rawBrakeRight)  canDigIn |= 0x02;   // bit 1 = digital in 1 (brake left)
+  if (mapCanPulsePending) canDigIn |= 0x04;   // bit 2 = one-shot map pulse
   // bit 3 = digital in 3 (reverse): high when drive FSM is in any reverse state
   if (fsmDrive == ST_DRIVE_REVERSE || fsmDrive == ST_DRIVE_REVERSE_LOCK || fsmDrive == ST_DRIVE_REV_PENDING)
     canDigIn |= 0x08;
-  if (fsmMapping == ST_MAPPING_PRESSED) canDigIn |= 0x10;   // bit 4 = map switch pulse
 
   // ── Byte 7: Commands ──
   canCmd = 0;
@@ -1590,7 +1651,9 @@ void sendCanControl() {
   msg.data[6] = canDigIn;
   msg.data[7] = canCmd;
 
-  twai_transmit(&msg, pdMS_TO_TICKS(5));
+  if (twai_transmit(&msg, pdMS_TO_TICKS(5)) == ESP_OK && mapCanPulsePending) {
+    mapCanPulsePending = false;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
