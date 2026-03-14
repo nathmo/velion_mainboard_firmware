@@ -546,6 +546,41 @@ uint32_t lastCanBroadcast = 0;
 // Web output controls
 bool webDefrosterTogglePending = false;
 
+// ── Manual output overrides ──────────────────────────────────────
+// Each output can be: -1 = FSM (auto), 0 = forced OFF, 1 = forced ON
+struct OutputOverride { const char *name; int8_t state; };  // state: -1/0/1
+#define OVR_IDX_CABIN      0
+#define OVR_IDX_DEFROSTER  1
+#define OVR_IDX_DRL_L      2
+#define OVR_IDX_DRL_R      3
+#define OVR_IDX_BLINK_L    4
+#define OVR_IDX_BLINK_R    5
+#define OVR_IDX_AUXAUDIO   6
+#define OVR_IDX_AUXUSB     7
+#define OVR_IDX_TRUNK_COIL 8
+#define OVR_IDX_SEAT_HTR   9
+#define OVR_IDX_HAND_HTR   10
+#define OVR_IDX_COUNT      11
+static OutputOverride webOverrides[OVR_IDX_COUNT] = {
+  {"cabin",      -1},
+  {"defroster",  -1},
+  {"drl_l",      -1},
+  {"drl_r",      -1},
+  {"blink_l",    -1},
+  {"blink_r",    -1},
+  {"auxaudio",   -1},
+  {"auxusb",     -1},
+  {"trunk_coil", -1},
+  {"seat_htr",   -1},
+  {"hand_htr",   -1},
+};
+// Helper: returns true if override is active (0 or 1), writes value to *out
+bool ovrGet(int idx, bool &out) {
+  if (webOverrides[idx].state < 0) return false;
+  out = (webOverrides[idx].state == 1);
+  return true;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  SETUP HELPERS
 // ═══════════════════════════════════════════════════════════════════
@@ -803,6 +838,18 @@ void handleRoot() {
     .btn-on{border-color:#238636;color:#3fb950}
     .btn-off{border-color:#da3633;color:#f85149}
     .hint{font-size:0.78em;color:#8b949e;margin-top:8px}
+  .ovr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:6px;margin-top:8px}
+  .ovr-row{display:flex;align-items:center;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:5px 8px;gap:6px}
+  .ovr-label{flex:1;font-size:0.88em;color:#c9d1d9}
+  .ovr-badge{font-size:0.75em;font-weight:bold;padding:2px 7px;border-radius:4px;min-width:38px;text-align:center}
+  .ovr-auto{background:#21262d;color:#8b949e;border:1px solid #30363d}
+  .ovr-on  {background:#0d4429;color:#3fb950;border:1px solid #238636}
+  .ovr-off {background:#390d0d;color:#f85149;border:1px solid #da3633}
+  .ovr-btn{border:1px solid #30363d;background:#0d1117;color:#8b949e;padding:3px 8px;
+           border-radius:4px;cursor:pointer;font-size:0.78em}
+  .ovr-btn:hover{background:#21262d;color:#c9d1d9}
+  .ovr-btn.active-on {background:#0d4429;color:#3fb950;border-color:#238636}
+  .ovr-btn.active-off{background:#390d0d;color:#f85149;border-color:#da3633}
   #canmon{background:#010409;border:1px solid #30363d;border-radius:8px;
           padding:8px;margin-top:10px;overflow-x:auto}
   #canmon table{width:100%;border-collapse:collapse;font-family:'Cascadia Code',monospace;font-size:0.82em}
@@ -814,7 +861,13 @@ void handleRoot() {
 </style></head><body>
 <h1>⚡ Velion Mainboard Dashboard</h1>
 <div class="grid" id="cards"></div>
-<h2>🖥️ CAN Bus Monitor</h2>
+<h2>� Manual Output Override</h2>
+<div style="margin-bottom:6px;display:flex;gap:8px;align-items:center">
+  <button class="btn btn-off" onclick="clearAllOverrides()">Release All (→ Auto)</button>
+  <span style="font-size:0.8em;color:#484f58">Overrides bypass the FSM completely</span>
+</div>
+<div class="ovr-grid" id="ovr-grid"></div>
+<h2>�🖥️ CAN Bus Monitor</h2>
 <div id="canmon"><table><thead><tr><th>ID</th><th>Data (hex)</th><th>Age</th></tr></thead><tbody id="canbody"></tbody></table></div>
 <div class="status-bar">Auto-refresh every 1 s &mdash; WiFi AP: Velion-Dashboard</div>
 <script>
@@ -842,14 +895,8 @@ function buildCards(d){
   h+=row('Brake Right',d.brakeR?'PRESSED':'Released');
   h+=row('Throttle ADC',d.throttle);
   h+='</table></div>';
-  // Output control card
-  h+='<div class="card"><h2>⚙️ Outputs</h2><table>';
-  h+=row('AUX Audio MOSFET',d.auxAudio?'ON':'OFF');
-  h+=row('Defroster MOSFET',d.defMosfet?'ON':'OFF');
-  h+='</table>';
-  h+='<div class="actions">';
-  h+='<button class="btn btn-on" onclick="toggleDefroster()">Toggle Defroster (FSM)</button>';
-  h+='</div><div class="hint">AUX Audio MOSFET is forced ON in firmware.</div></div>';
+  // Output control card — replaced by override panel below
+  // (output values still shown in state card via FSM rows)
   // Peripherals card
   h+='<div class="card"><h2>🔌 Peripherals</h2><table>';
   h+=row('MCP1 (0x21)',d.mcp1?'OK':'FAIL');
@@ -885,6 +932,42 @@ async function toggleDefroster(){
     poll();
   }catch(e){}
 }
+const OVR_LABELS={
+  cabin:'Cabin Light',defroster:'Defroster',drl_l:'DRL Left',drl_r:'DRL Right',
+  blink_l:'Blinker Left',blink_r:'Blinker Right',auxaudio:'AUX Audio',
+  auxusb:'AUX USB',trunk_coil:'Trunk Coil',seat_htr:'Seat Heater',hand_htr:'Hand Heater'
+};
+let ovrState={};
+function renderOverrides(ovr){
+  ovrState=ovr;
+  let g=document.getElementById('ovr-grid');
+  let h='';
+  for(let[k,s] of Object.entries(ovr)){
+    let label=OVR_LABELS[k]||k;
+    let badge=s==='auto'?'<span class="ovr-badge ovr-auto">AUTO</span>':
+              s==='on'  ?'<span class="ovr-badge ovr-on">ON</span>':
+                         '<span class="ovr-badge ovr-off">OFF</span>';
+    let ba=s==='on' ?'active-on':'';
+    let bo=s==='off'?'active-off':'';
+    h+='<div class="ovr-row">'+badge+'<span class="ovr-label">'+label+'</span>'
+      +'<button class="ovr-btn '+ba+'" onclick="setOvr(\''+k+'\',\'on\')">ON</button>'
+      +'<button class="ovr-btn '+bo+'" onclick="setOvr(\''+k+'\',\'off\')">OFF</button>'
+      +'<button class="ovr-btn" onclick="setOvr(\''+k+'\',\'auto\')">AUTO</button>'
+      +'</div>';
+  }
+  g.innerHTML=h;
+}
+async function setOvr(name,action){
+  try{await fetch('/api/output?name='+name+'&action='+action);}catch(e){}
+  pollOverrides();
+}
+async function clearAllOverrides(){
+  try{await fetch('/api/output?name=all&action=clearall');}catch(e){}
+  pollOverrides();
+}
+async function pollOverrides(){
+  try{let r=await fetch('/api/override');let d=await r.json();renderOverrides(d.overrides);}catch(e){}
+}
 async function poll(){
   try{
     let r=await fetch('/api/state');let d=await r.json();buildCards(d);
@@ -892,7 +975,8 @@ async function poll(){
   }catch(e){}
 }
 setInterval(poll,1000);
-poll();
+setInterval(pollOverrides,1000);
+poll();pollOverrides();
 </script></body></html>
 )rawliteral";
   webServer.send(200, "text/html", html);
@@ -946,16 +1030,55 @@ void handleApiOutput() {
     return;
   }
 
-  String name = webServer.arg("name");
-  String action = webServer.arg("action");
+  String name   = webServer.arg("name");
+  String action = webServer.arg("action");  // "on" | "off" | "auto" | "clearall"
 
+  if (action == "clearall") {
+    for (int i = 0; i < OVR_IDX_COUNT; i++) webOverrides[i].state = -1;
+    webServer.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+
+  // Legacy defroster toggle kept for compatibility
   if (name == "defroster" && action == "toggle") {
     webDefrosterTogglePending = true;
     webServer.send(200, "application/json", "{\"ok\":true,\"name\":\"defroster\",\"action\":\"toggle\"}");
     return;
   }
 
-  webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"unknown output\"}");
+  int8_t newState;
+  if      (action == "on")   newState =  1;
+  else if (action == "off")  newState =  0;
+  else if (action == "auto") newState = -1;
+  else {
+    webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"action must be on/off/auto/clearall\"}");
+    return;
+  }
+
+  for (int i = 0; i < OVR_IDX_COUNT; i++) {
+    if (String(webOverrides[i].name) == name) {
+      webOverrides[i].state = newState;
+      webServer.send(200, "application/json", "{\"ok\":true}");
+      return;
+    }
+  }
+  webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"unknown output name\"}");
+}
+
+// ── JSON API: override state query ──────────────────────────────
+void handleApiOverride() {
+  String out = "{\"overrides\":{";
+  for (int i = 0; i < OVR_IDX_COUNT; i++) {
+    if (i > 0) out += ",";
+    out += "\"";
+    out += webOverrides[i].name;
+    out += "\":";
+    if      (webOverrides[i].state < 0) out += "\"auto\"";
+    else if (webOverrides[i].state == 0) out += "\"off\"";
+    else                                out += "\"on\"";
+  }
+  out += "}}";
+  webServer.send(200, "application/json", out);
 }
 
 // ── JSON API: CAN monitor ────────────────────────────────────────
@@ -1002,10 +1125,11 @@ void setupWiFiAP() {
   Serial.printf("[WiFi] AP started: SSID=%s  IP=%s\n", WIFI_SSID, WiFi.softAPIP().toString().c_str());
   Serial.printf("[WiFi] DHCP lease range starts at %s (static reserved: 192.168.4.1-10)\n", dhcpStart.toString().c_str());
 
-  webServer.on("/",          handleRoot);
-  webServer.on("/api/state", handleApiState);
-  webServer.on("/api/can",   handleApiCan);
-  webServer.on("/api/output", handleApiOutput);
+  webServer.on("/",              handleRoot);
+  webServer.on("/api/state",     handleApiState);
+  webServer.on("/api/can",       handleApiCan);
+  webServer.on("/api/output",    handleApiOutput);
+  webServer.on("/api/override",  handleApiOverride);
   webServer.begin();
   Serial.println("[WiFi] Web server started on port 80");
 }
@@ -1622,21 +1746,40 @@ void fsmStepLowbeam() {
 //  OUTPUT STAGE — apply FSM states to hardware
 // ═══════════════════════════════════════════════════════════════════
 void applyOutputs() {
+  bool v;
+
   // ---- POWER MOSFET (MCP1 GPA3): always ON ----
   if (mcp1_ok) {
     mcp1.digitalWrite(MCP1_POWER_GATE, HIGH);
-    mcp1.digitalWrite(MCP1_AUXAUDIO_GATE, HIGH);  // forced ON for now
+  }
+
+  // ---- AUX AUDIO (MCP1 GPA0) ----
+  if (mcp1_ok) {
+    bool auxAudioOn = true;  // default forced ON
+    if (ovrGet(OVR_IDX_AUXAUDIO, v)) auxAudioOn = v;
+    mcp1.digitalWrite(MCP1_AUXAUDIO_GATE, auxAudioOn ? HIGH : LOW);
+  }
+
+  // ---- AUX USB (MCP1 GPA1) ----
+  if (mcp1_ok) {
+    bool auxUsbOn = false;  // default OFF
+    if (ovrGet(OVR_IDX_AUXUSB, v)) auxUsbOn = v;
+    mcp1.digitalWrite(MCP1_AUXUSB_GATE, auxUsbOn ? HIGH : LOW);
   }
 
   // ---- CABIN LIGHT (ESP GPIO 15 + MCP1 GPB1 CABLIGHT_LED) ----
-  bool cabOn = (fsmCabinLight != ST_CABINLIGHT_OFF);
-  digitalWrite(INTERRIOR_LIGHT_MOSFET_GATE, cabOn ? HIGH : LOW);
-  if (mcp1_ok) mcp1.digitalWrite(MCP1_CABLIGHT_LED, cabOn ? HIGH : LOW);
+  {
+    bool cabOn = (fsmCabinLight != ST_CABINLIGHT_OFF);
+    if (ovrGet(OVR_IDX_CABIN, v)) cabOn = v;
+    digitalWrite(INTERRIOR_LIGHT_MOSFET_GATE, cabOn ? HIGH : LOW);
+    if (mcp1_ok) mcp1.digitalWrite(MCP1_CABLIGHT_LED, cabOn ? HIGH : LOW);
+  }
 
   // ---- TRUNK ----
   if (mcp1_ok) {
     bool trunkCoil = (fsmTrunk == ST_TRUNK_OPENING);
-    bool trunkLed  = (fsmTrunk == ST_TRUNK_OPENING || fsmTrunk == ST_TRUNK_BLINK_ON);
+    if (ovrGet(OVR_IDX_TRUNK_COIL, v)) trunkCoil = v;
+    bool trunkLed  = (fsmTrunk == ST_TRUNK_OPENING || fsmTrunk == ST_TRUNK_BLINK_ON) || trunkCoil;
     mcp1.digitalWrite(MCP1_LATCH_TRUNK_GATE, trunkCoil ? HIGH : LOW);
     mcp1.digitalWrite(MCP1_TRUNK_LED,        trunkLed  ? HIGH : LOW);
   }
@@ -1650,6 +1793,7 @@ void applyOutputs() {
   // ---- DEFROSTER ----
   {
     bool defMosfet = (fsmDefroster == ST_FSM_DEFROSTER_ON);
+    if (ovrGet(OVR_IDX_DEFROSTER, v)) defMosfet = v;
     bool defLed    = defMosfet || (fsmDefroster == ST_FSM_DEFROSTER_FAULT_BLINK_ON);
     digitalWrite(DEFROSTER_MOSFET_GATE, defMosfet ? HIGH : LOW);
     if (mcp1_ok) mcp1.digitalWrite(MCP1_DEFROST_LED, defLed ? HIGH : LOW);
@@ -1668,6 +1812,8 @@ void applyOutputs() {
   {
     bool blinkLeftOn  = (fsmBlinker == ST_BLINKER_LEFT_ON  || fsmBlinker == ST_WARNING_ON);
     bool blinkRightOn = (fsmBlinker == ST_BLINKER_RIGHT_ON || fsmBlinker == ST_WARNING_ON);
+    if (ovrGet(OVR_IDX_BLINK_L, v)) blinkLeftOn  = v;
+    if (ovrGet(OVR_IDX_BLINK_R, v)) blinkRightOn = v;
     digitalWrite(BLIKER_LEFT_MOSFET_GATE,  blinkLeftOn  ? HIGH : LOW);
     digitalWrite(BLIKER_RIGHT_MOSFET_GATE, blinkRightOn ? HIGH : LOW);
   }
@@ -1675,8 +1821,25 @@ void applyOutputs() {
   // ---- DRL ----
   {
     bool drlOn = (fsmDrl == ST_DRL_ON || fsmDrl == ST_DRL_ON_GRACE);
-    digitalWrite(DRL_LEFT_MOSFET_GATE,  drlOn ? HIGH : LOW);
-    digitalWrite(DRL_RIGHT_MOSFET_GATE, drlOn ? HIGH : LOW);
+    bool drlL = drlOn, drlR = drlOn;
+    if (ovrGet(OVR_IDX_DRL_L, v)) drlL = v;
+    if (ovrGet(OVR_IDX_DRL_R, v)) drlR = v;
+    digitalWrite(DRL_LEFT_MOSFET_GATE,  drlL ? HIGH : LOW);
+    digitalWrite(DRL_RIGHT_MOSFET_GATE, drlR ? HIGH : LOW);
+  }
+
+  // ---- SEAT HEATER (GPIO 5) ----
+  {
+    bool seatHtr = false;  // no FSM currently — override only
+    if (ovrGet(OVR_IDX_SEAT_HTR, v)) seatHtr = v;
+    digitalWrite(SEATHEATER_MOSFET_GATE, seatHtr ? HIGH : LOW);
+  }
+
+  // ---- HAND HEATER (GPIO 4) ----
+  {
+    bool handHtr = false;  // no FSM currently — override only
+    if (ovrGet(OVR_IDX_HAND_HTR, v)) handHtr = v;
+    digitalWrite(HANDHEATER_MOSFET_GATE, handHtr ? HIGH : LOW);
   }
 }
 
