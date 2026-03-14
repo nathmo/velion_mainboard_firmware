@@ -76,16 +76,32 @@ enum LowbeamState    { ST_LOWBEAM_OFF, ST_LOWBEAM_ON, ST_LOWBEAM_ON_GRACE };
 
 WebServer webServer(80);
 
-// CAN packet log ring buffer for the web terminal
-#define CAN_LOG_SIZE 200
-String canLog[CAN_LOG_SIZE];
-int    canLogHead = 0;
-int    canLogCount = 0;
+// CAN per-ID tracker for the web monitor (latest packet per ID)
+#define CAN_TRACK_MAX 32
+struct CanEntry {
+  uint32_t id;
+  char     data[32]; // hex bytes string
+  uint32_t lastMs;
+};
+static CanEntry canTrack[CAN_TRACK_MAX];
+static int      canTrackCount = 0;
 
-void canLogPush(const String &line) {
-  canLog[canLogHead] = line;
-  canLogHead = (canLogHead + 1) % CAN_LOG_SIZE;
-  if (canLogCount < CAN_LOG_SIZE) canLogCount++;
+void canTrackUpdate(uint32_t id, const char *dataStr) {
+  for (int i = 0; i < canTrackCount; i++) {
+    if (canTrack[i].id == id) {
+      strncpy(canTrack[i].data, dataStr, sizeof(canTrack[i].data) - 1);
+      canTrack[i].data[sizeof(canTrack[i].data) - 1] = '\0';
+      canTrack[i].lastMs = millis();
+      return;
+    }
+  }
+  if (canTrackCount < CAN_TRACK_MAX) {
+    canTrack[canTrackCount].id = id;
+    strncpy(canTrack[canTrackCount].data, dataStr, sizeof(canTrack[canTrackCount].data) - 1);
+    canTrack[canTrackCount].data[sizeof(canTrack[canTrackCount].data) - 1] = '\0';
+    canTrack[canTrackCount].lastMs = millis();
+    canTrackCount++;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -204,6 +220,7 @@ bool mpu_ok = false, bmp_ok = false;
 #define CAN_ID_MB_BLINKER    0x421   // TX: blinker/warning state
 #define CAN_ID_MB_DRIVE      0x422   // TX: drive direction (fwd/rev/neutral)
 #define CAN_ID_MB_BRAKE      0x423   // TX: brake / regen level
+#define CAN_ID_MB_WARNING    0x424   // TX: effective L/R blinker lamp state
 
 // Speed threshold
 #define SPEED_THRESHOLD_KPH  5
@@ -786,15 +803,19 @@ void handleRoot() {
     .btn-on{border-color:#238636;color:#3fb950}
     .btn-off{border-color:#da3633;color:#f85149}
     .hint{font-size:0.78em;color:#8b949e;margin-top:8px}
-  #term{background:#010409;border:1px solid #30363d;border-radius:8px;
-        padding:8px;font-family:'Cascadia Code',monospace;font-size:0.82em;
-        height:340px;overflow-y:auto;white-space:pre;color:#7ee787;margin-top:10px}
+  #canmon{background:#010409;border:1px solid #30363d;border-radius:8px;
+          padding:8px;margin-top:10px;overflow-x:auto}
+  #canmon table{width:100%;border-collapse:collapse;font-family:'Cascadia Code',monospace;font-size:0.82em}
+  #canmon th{color:#58a6ff;text-align:left;padding:4px 8px;border-bottom:2px solid #30363d;white-space:nowrap}
+  #canmon td{padding:3px 8px;border-bottom:1px solid #161b22;white-space:nowrap}
+  .can-fresh{color:#7ee787}
+  .can-stale{color:#8b949e}
   .status-bar{text-align:center;font-size:0.8em;color:#484f58;margin-top:8px}
 </style></head><body>
 <h1>⚡ Velion Mainboard Dashboard</h1>
 <div class="grid" id="cards"></div>
-<h2>🖥️ CAN Bus Terminal</h2>
-<div id="term"></div>
+<h2>🖥️ CAN Bus Monitor</h2>
+<div id="canmon"><table><thead><tr><th>ID</th><th>Data (hex)</th><th>Age</th></tr></thead><tbody id="canbody"></tbody></table></div>
 <div class="status-bar">Auto-refresh every 1 s &mdash; WiFi AP: Velion-Dashboard</div>
 <script>
 function cls(v){return (v==='OFF'||v==='IDLE'||v==='NEUTRAL'||v==='CLEAR'||v==='0%')?'off':'on';}
@@ -843,10 +864,20 @@ function buildCards(d){
   h+='</table></div>';
   document.getElementById('cards').innerHTML=h;
 }
-function updateTerm(lines){
-  let t=document.getElementById('term');
-  t.textContent=lines.join('\n');
-  t.scrollTop=t.scrollHeight;
+function updateTerm(entries){
+  let tb=document.getElementById('canbody');
+  if(!entries||entries.length===0){
+    tb.innerHTML='<tr><td colspan="3" style="color:#484f58;text-align:center;padding:12px">No CAN packets received</td></tr>';
+    return;
+  }
+  let h='';
+  for(let e of entries){
+    let fresh=e.age<2000;
+    let cls=fresh?'can-fresh':'can-stale';
+    let age=e.age<1000?e.age+'ms':(e.age/1000).toFixed(1)+'s';
+    h+='<tr class="'+cls+'"><td>'+e.id+'</td><td>'+e.data.trim()+'</td><td>'+age+'</td></tr>';
+  }
+  tb.innerHTML=h;
 }
 async function toggleDefroster(){
   try{
@@ -857,7 +888,7 @@ async function toggleDefroster(){
 async function poll(){
   try{
     let r=await fetch('/api/state');let d=await r.json();buildCards(d);
-    let r2=await fetch('/api/can');let d2=await r2.json();updateTerm(d2.lines);
+    let r2=await fetch('/api/can');let d2=await r2.json();updateTerm(d2.entries);
   }catch(e){}
 }
 setInterval(poll,1000);
@@ -927,18 +958,28 @@ void handleApiOutput() {
   webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"unknown output\"}");
 }
 
-// ── JSON API: CAN log ────────────────────────────────────────────
+// ── JSON API: CAN monitor ────────────────────────────────────────
 void handleApiCan() {
-  String out = "{\"lines\":[";
-  int start = (canLogCount < CAN_LOG_SIZE) ? 0 : canLogHead;
-  int count = canLogCount;
-  for (int i = 0; i < count; i++) {
-    int idx = (start + i) % CAN_LOG_SIZE;
+  // Sort indices by CAN ID (insertion sort, max 32 entries)
+  int order[CAN_TRACK_MAX];
+  for (int i = 0; i < canTrackCount; i++) order[i] = i;
+  for (int i = 1; i < canTrackCount; i++) {
+    int key = order[i], j = i - 1;
+    while (j >= 0 && canTrack[order[j]].id > canTrack[key].id) {
+      order[j + 1] = order[j]; j--;
+    }
+    order[j + 1] = key;
+  }
+
+  uint32_t now = millis();
+  String out = "{\"entries\":[";
+  for (int i = 0; i < canTrackCount; i++) {
+    int idx = order[i];
     if (i > 0) out += ",";
-    // Escape quotes in the log line
-    String escaped = canLog[idx];
-    escaped.replace("\"", "\\\"");
-    out += "\"" + escaped + "\"";
+    char tmp[96];
+    snprintf(tmp, sizeof(tmp), "{\"id\":\"0x%03X\",\"data\":\"%s\",\"age\":%lu}",
+             canTrack[idx].id, canTrack[idx].data, (unsigned long)(now - canTrack[idx].lastMs));
+    out += tmp;
   }
   out += "]}";
   webServer.send(200, "application/json", out);
@@ -1031,14 +1072,21 @@ void readButtons() {
 void readCAN() {
   twai_message_t msg;
   while (twai_receive(&msg, 0) == ESP_OK) {
-    // Build log string for serial + web terminal
+    // Build log string for serial output
     char buf[80];
     int pos = snprintf(buf, sizeof(buf), "[CAN RX] ID=0x%03X DLC=%d Data=", msg.identifier, msg.data_length_code);
     for (int i = 0; i < msg.data_length_code && pos < (int)sizeof(buf) - 4; i++) {
       pos += snprintf(buf + pos, sizeof(buf) - pos, "%02X ", msg.data[i]);
     }
     Serial.println(buf);
-    canLogPush(String(buf));
+
+    // Update per-ID web monitor entry
+    char dataBuf[32];
+    int  dpos = 0;
+    for (int i = 0; i < msg.data_length_code && dpos < (int)sizeof(dataBuf) - 3; i++) {
+      dpos += snprintf(dataBuf + dpos, sizeof(dataBuf) - dpos, "%02X ", msg.data[i]);
+    }
+    canTrackUpdate(msg.identifier, dataBuf);
 
     // Parse known IDs (all little-endian per SiliXcon docs)
     switch (msg.identifier) {
@@ -1705,7 +1753,7 @@ void sendCanControl() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  CAN TX: Mainboard broadcast (0x420-0x423, every 100 ms)
+//  CAN TX: Mainboard broadcast (0x420-0x424, every 100 ms)
 // ═══════════════════════════════════════════════════════════════════
 void sendCanBroadcast() {
   uint32_t now = millis();
@@ -1754,6 +1802,13 @@ void sendCanBroadcast() {
     case ST_BRAKE_LEVEL_50:  msg.data[0] = 50;  break;
     case ST_BRAKE_LEVEL_100: msg.data[0] = 100; break;
   }
+  twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+  // --- 0x424: Effective blink lamp state (mirror front/rear boards) ---
+  msg.identifier       = CAN_ID_MB_WARNING;
+  msg.data_length_code = 2;
+  msg.data[0] = (fsmBlinker == ST_BLINKER_LEFT_ON  || fsmBlinker == ST_WARNING_ON) ? 1 : 0;
+  msg.data[1] = (fsmBlinker == ST_BLINKER_RIGHT_ON || fsmBlinker == ST_WARNING_ON) ? 1 : 0;
   twai_transmit(&msg, pdMS_TO_TICKS(5));
 }
 
